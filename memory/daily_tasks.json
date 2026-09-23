@@ -1,0 +1,19 @@
+{
+  "930bd130": {
+    "id": "930bd130",
+    "name": "morning_notes",
+    "task": "Open Notepad and write the date",
+    "app": "",
+    "schedule": {
+      "type": "daily",
+      "next_run": "2026-09-24T09:00:00",
+      "interval_sec": null,
+      "time_str": "09:00",
+      "days": null,
+      "raw": "every day at 9am"
+    },
+    "created": "2026-09-23T16:52:27.153083",
+    "notify_on_complete": true,
+    "running": false
+  }
+}

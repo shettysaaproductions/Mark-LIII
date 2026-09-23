@@ -1,0 +1,10 @@
+{
+  "gemini_api_key": "YOUR_GEMINI_API_KEY_HERE",
+  "os_system": "windows",
+  "assistant_name": "JARVIS",
+  "voice_name": "Charon",
+  "wake_word_enabled": false,
+  "morning_brief_enabled": true,
+  "server_mode": false,
+  "server_token": "YOUR_OPTIONAL_SERVER_TOKEN"
+}

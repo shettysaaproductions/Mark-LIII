@@ -80,6 +80,38 @@ from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
 )
 
+# ── Server mode (optional — needs: pip install fastapi "uvicorn[standard]") ───
+try:
+    from server.jarvis_server import (
+        start_server as _start_server,
+        set_send_fn  as _srv_set_send,
+        append_log   as _srv_log,
+        get_server_info as _srv_info,
+        set_registries as _srv_set_reg,
+    )
+    _SERVER_AVAILABLE = True
+except Exception:
+    _SERVER_AVAILABLE = False
+    _srv_log = lambda _: None
+    _srv_info = lambda: {"running": False}
+
+# ── Multi-key manager (multiplies free-tier rate limits) ───────────────
+try:
+    from core.multi_key_manager import get_key as _get_next_key, report_quota_hit as _report_quota
+    _MULTI_KEY = True
+except Exception:
+    _MULTI_KEY = False
+    _get_next_key = lambda: ""
+    _report_quota = lambda _: None
+
+# ── Autonomous task scheduler + Laya preload ─────────────────────
+try:
+    from actions.daily_task_agent import start_scheduler as _start_scheduler
+    _SCHEDULER_AVAILABLE = True
+except Exception:
+    _SCHEDULER_AVAILABLE = False
+    _start_scheduler = None
+
 # How long the assistant stays awake with no user speech before it auto-sleeps
 # again (wake-word mode only).
 WAKE_SLEEP_TIMEOUT = 120.0   # seconds (2 minutes)
@@ -611,12 +643,10 @@ class JarvisLive:
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
             return
-        # Respect wake-word sleep: a typed command must not be answered while
-        # asleep either (the sleep gate is not just for the mic). Wake first with
-        # "Hey Jarvis" or the WAKE NOW button.
+        # Chat mode always works — if wake-word mode is on and Jarvis is asleep,
+        # silently wake it first so the user can always type to it.
         if self._wake_enabled and not self._awake:
-            self.ui.write_log("SYS: I'm asleep — say 'Hey Jarvis' or tap WAKE NOW first.")
-            return
+            self.wake(reason="chat message")
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
                 turns={"role": "user", "parts": [{"text": text}]},
@@ -1555,6 +1585,55 @@ class JarvisLive:
             print(f"[Dashboard] Disabled: {e}")
             self._dashboard = None
 
+        # Start Jarvis API server (optional — needs: pip install fastapi "uvicorn[standard]")
+        # Enables: POST /chat, WS /ws, GET /status, GET /memory, POST /action
+        _cfg = json.loads(open(API_CONFIG_PATH, encoding="utf-8").read()) if API_CONFIG_PATH.exists() else {}
+        if _SERVER_AVAILABLE and _cfg.get("server_mode", False):
+            _srv_set_reg(self._action_registry, self._plugin_registry)
+            _srv_set_send(self._on_text_command)
+            _start_server(
+                send_fn=self._on_text_command,
+                action_reg=self._action_registry,
+                plugin_reg=self._plugin_registry,
+                log_fn=self.ui.write_log,
+            )
+        elif _SERVER_AVAILABLE:
+            # Always wire send fn even if server not started, so it can be enabled later
+            _srv_set_send(self._on_text_command)
+            _srv_set_reg(self._action_registry, self._plugin_registry)
+
+        # ── Start 24/7 autonomous task scheduler ─────────────────────────────
+        if _SCHEDULER_AVAILABLE and _start_scheduler:
+            try:
+                _agent_ctx = {
+                    "speak":  self._speak_text if hasattr(self, '_speak_text') else None,
+                    "player": self.ui,
+                }
+                self._scheduler = _start_scheduler(
+                    ctx=_agent_ctx,
+                    log=self.ui.write_log,
+                )
+                self.ui.write_log("SYS: Autonomous scheduler active (24/7 tasks enabled).")
+            except Exception as _se:
+                print(f"[Scheduler] Startup error: {_se}")
+                self._scheduler = None
+        else:
+            self._scheduler = None
+
+        # ── Preload Laya local decision model in background ─────────────────
+        try:
+            from actions.laya_win import preload as _laya_preload
+            _laya_preload(log=self.ui.write_log)
+        except Exception:
+            pass
+
+        # ── Log key count ───────────────────────────────────────────
+        if _MULTI_KEY:
+            from core.multi_key_manager import key_count
+            n = key_count()
+            if n > 1:
+                self.ui.write_log(f"SYS: {n} API keys loaded — effective free RPM ≈ {n*15}.")
+
         while True:
             try:
                 print("[JARVIS] Connecting...")
@@ -1565,8 +1644,12 @@ class JarvisLive:
                 # Fresh client on every reconnect — avoids stale HTTP session state
                 # v1alpha carries proactive audio; if it gets rejected we fall
                 # back to v1beta.
+                # Use multi-key manager so all configured keys are used in rotation.
+                _live_key = _get_next_key() if _MULTI_KEY else _get_api_key()
+                if not _live_key:
+                    _live_key = _get_api_key()
                 client = genai.Client(
-                    api_key=_get_api_key(),
+                    api_key=_live_key,
                     http_options={"api_version": "v1alpha" if self._enhanced_live else "v1beta"}
                 )
 

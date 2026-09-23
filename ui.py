@@ -3784,6 +3784,15 @@ class MainWindow(QMainWindow):
         settings_btn.clicked.connect(self._open_plugin_settings)
         lay.addWidget(settings_btn)
 
+        # ── Server mode ────────────────────────────────────────────────────────
+        self._server_btn = QPushButton("🖥  SERVER MODE: OFF")
+        self._server_btn.setFixedHeight(26)
+        self._server_btn.setFont(QFont("Courier New", 7))
+        self._server_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._server_btn.clicked.connect(self._toggle_server_mode)
+        lay.addWidget(self._server_btn)
+        self._refresh_server_btn()
+
         w.adjustSize()
         return w
 
@@ -4114,6 +4123,76 @@ class MainWindow(QMainWindow):
         new_val = not get_brief_enabled()
         save_brief_enabled(new_val)
         self._update_brief_btn(new_val)
+
+    # ── Server mode ──────────────────────────────────────────────────────────
+
+    def _is_server_enabled(self) -> bool:
+        try:
+            import json
+            d = json.loads(API_FILE.read_text(encoding="utf-8"))
+            return bool(d.get("server_mode", False))
+        except Exception:
+            return False
+
+    def _refresh_server_btn(self):
+        if not hasattr(self, "_server_btn"):
+            return
+        enabled = self._is_server_enabled()
+        if enabled:
+            self._server_btn.setText("🖥  SERVER MODE: ON")
+            self._server_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: #001a08; color: {C.GREEN};
+                    border: 1px solid {C.GREEN_D}; border-radius: 3px;
+                }}
+                QPushButton:hover {{ background: #002010; }}
+            """)
+        else:
+            self._server_btn.setText("🖥  SERVER MODE: OFF")
+            self._server_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: transparent; color: {C.TEXT_MED};
+                    border: 1px solid {C.BORDER}; border-radius: 3px;
+                }}
+                QPushButton:hover {{ color: {C.PRI}; border-color: {C.BORDER_B}; }}
+            """)
+
+    def _toggle_server_mode(self):
+        try:
+            import json as _json
+            cfg = _json.loads(API_FILE.read_text(encoding="utf-8"))
+            new_val = not bool(cfg.get("server_mode", False))
+            cfg["server_mode"] = new_val
+            API_FILE.write_text(_json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+            self._refresh_server_btn()
+
+            if new_val:
+                # Try to start server immediately without restart
+                try:
+                    from server.jarvis_server import (
+                        start_server as _start,
+                        get_server_info as _info,
+                    )
+                    ok, msg = _start(log_fn=self._log_sig.emit)
+                    if ok:
+                        info = _info()
+                        url  = info.get("url", "")
+                        tok  = info.get("token", "")
+                        self._log.append_log(f"SYS: Server ON — {url}")
+                        self._log.append_log(f"SYS: Token: {tok}")
+                    else:
+                        self._log.append_log(f"SYS: Server failed — {msg}")
+                        self._log.append_log(
+                            "SYS: Install with: pip install fastapi \"uvicorn[standard]\""
+                        )
+                except ImportError:
+                    self._log.append_log(
+                        "SYS: FastAPI not installed — run: pip install fastapi \"uvicorn[standard]\""
+                    )
+            else:
+                self._log.append_log("SYS: Server mode disabled — restart to fully stop server.")
+        except Exception as e:
+            self._log.append_log(f"ERR: Server toggle failed — {e}")
 
     # ── Wake word settings ───────────────────────────────────────────────────
 
