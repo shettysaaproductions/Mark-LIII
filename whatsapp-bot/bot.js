@@ -105,7 +105,8 @@ import {
   syncResumeToGraph,
   handleBossSidewaysInteraction,
   isReferralResume,
-  handleReferralResume
+  handleReferralResume,
+  checkAndResolvePendingReferral
 } from './candidate_graph.js';
 
 
@@ -1224,12 +1225,16 @@ async function handleIncomingMessage(msg, overrideText = null) {
             const chat = await msg.getChat().catch(() => null);
             if (chat) await chat.sendStateTyping().catch(() => {});
           })();
-          await safeSend(msg, `Got your resume! Scanning your details... 📄`);
+          await safeSend(msg, `Got the document! Scanning details... 📄`);
           const parsed = await parseResumeWithAI(rawText || '', mediaParts);
 
           // ALWAYS use WhatsApp sender phone — never let it be empty
           const senderPhone = candidatePhone || phoneFromWaId(talkerId);
           const senderName = contactName || 'Friend';
+
+          // Look up sender record beforehand so existing sender is known
+          const senderMatches = senderPhone ? await searchCandidate(senderPhone).catch(() => []) : [];
+          const existingSenderRecord = (senderMatches && senderMatches.length > 0) ? senderMatches[0] : null;
 
           // ── MULTI-RESUME & REFERRAL DETECTION LAW ─────────────────────────
           // If the resume has a different phone number or name from the sender,
@@ -1240,7 +1245,7 @@ async function handleIncomingMessage(msg, overrideText = null) {
             parsed?.phone,
             parsed?.name,
             rawText || '',
-            existingCand
+            existingSenderRecord
           );
 
           if (referralResult.isReferral) {
@@ -1258,8 +1263,8 @@ async function handleIncomingMessage(msg, overrideText = null) {
             clearIntakeState(talkerId);
           }
 
-          // Check if candidate already exists (by WhatsApp phone — always reliable)
-          const existingMatches = senderPhone ? await searchCandidate(senderPhone) : [];
+          // Use previously fetched sender record
+          const existingMatches = senderMatches;
 
 
           if (existingMatches && existingMatches.length > 0) {
@@ -1440,6 +1445,20 @@ async function handleIncomingMessage(msg, overrideText = null) {
         if (candidatePhone && existingCand.phone !== candidatePhone) {
           await updateCandidateStatus(existingCand.phone || existingCand.name, { phone: candidatePhone });
         }
+      }
+    }
+  }
+
+  // ── PENDING REFERRAL PHONE NUMBER RESOLUTION ─────────────────────────────
+  // If this contact recently uploaded a referral resume without a phone number,
+  // and now sends a text message containing the phone number, resolve it immediately!
+  if (!senderIsRecruiter && !isShettyOfficeGroup && rawText) {
+    const senderPh = candidatePhone || phoneFromWaId(talkerId);
+    if (senderPh) {
+      const resolvedAck = await checkAndResolvePendingReferral(client, senderPh, contactName, rawText);
+      if (resolvedAck) {
+        await safeSend(msg, resolvedAck);
+        return;
       }
     }
   }

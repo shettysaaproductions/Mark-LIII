@@ -190,7 +190,7 @@ export async function updateCandidateGraphNode(phone, updates = {}) {
     'gender', 'location', 'qualification', 'experience', 'years',
     'inhand_salary', 'process', 'last_company', 'shift_preference',
     'cooling_period_active', 'boss_story_shared', 'ig_connected',
-    'reference_culture_pitched', 'last_boss_message', 'last_boss_message_ts',
+    'reference_culture_pitched', 'pending_referral', 'last_boss_message', 'last_boss_message_ts',
     'last_candidate_message', 'last_candidate_message_ts', 'sideways_followup_pending'
   ];
 
@@ -268,18 +268,31 @@ export function isReferralResume(senderPhone, senderName, cvPhone, cvName, rawTe
   }
 
   // 2. If sender text explicitly mentions referral / friend / reference / multiple resumes
-  const referralKeywords = /\b(?:refer|ref|reference|friend|dost|colleague|brother|sister|bhai|candidate|dono|both|dono\s*ka|ye\s*cv|check\s*this|unka|uska|frnd|freind)\b/i;
+  const referralKeywords = /\b(?:refer|ref|reference|friend|dost|colleague|brother|sister|bhai|candidate|dono|both|dono\s*ka|ye\s*cv|check\s*this|unka|uska|frnd|freind|second|another)\b/i;
   if (referralKeywords.test(rawText)) {
     return { isReferral: true, reason: 'text_indicated', refPhone: cleanCvPhone || null };
   }
 
-  // 3. If sender already exists with a verified different name, and CV has a valid different person name
-  if (existingSenderRecord && existingSenderRecord.name && isVerifiedPersonName(existingSenderRecord.name)) {
+  // 3. Sender name vs CV name check
+  const effectiveSenderName = (existingSenderRecord?.name && isVerifiedPersonName(existingSenderRecord.name))
+    ? existingSenderRecord.name
+    : (isVerifiedPersonName(senderName) ? senderName : '');
+
+  if (effectiveSenderName && cvName && isVerifiedPersonName(cvName)) {
+    const sFirst = effectiveSenderName.toLowerCase().split(/\s+/)[0];
+    const cvFirst = cvName.toLowerCase().split(/\s+/)[0];
+    if (sFirst !== cvFirst && sFirst.length > 2 && cvFirst.length > 2) {
+      return { isReferral: true, reason: 'different_name', refPhone: cleanCvPhone || null };
+    }
+  }
+
+  // 4. If sender is already placed / working / lineup confirmed, any new resume with different name is a referral
+  if (existingSenderRecord && (existingSenderRecord.joined_status === 'Yes' || existingSenderRecord.lineup_status === 'Yes' || existingSenderRecord.last_company)) {
     if (cvName && isVerifiedPersonName(cvName)) {
-      const sFirst = existingSenderRecord.name.toLowerCase().split(/\s+/)[0];
-      const cvFirst = cvName.toLowerCase().split(/\s+/)[0];
-      if (sFirst !== cvFirst && sFirst.length > 2 && cvFirst.length > 2) {
-        return { isReferral: true, reason: 'different_name_and_existing_sender', refPhone: cleanCvPhone || null };
+      const sFull = (existingSenderRecord.name || '').toLowerCase().trim();
+      const cvFull = cvName.toLowerCase().trim();
+      if (sFull && cvFull && sFull !== cvFull) {
+        return { isReferral: true, reason: 'existing_placed_candidate_sent_cv', refPhone: cleanCvPhone || null };
       }
     }
   }
@@ -311,9 +324,7 @@ export async function handleReferralResume(client, senderPhone, senderName, pars
     if (existingMatches && existingMatches.length > 0) {
       const existingRef = existingMatches[0];
       targetCandId = existingRef.id;
-      const updates = {
-        referred_by: `${senderName} (${cleanSenderPhone})`
-      };
+      const updates = {};
       if (cvName !== 'Referred Candidate' && (!existingRef.name || !isVerifiedPersonName(existingRef.name))) {
         updates.name = cvName;
       }
@@ -323,11 +334,13 @@ export async function handleReferralResume(client, senderPhone, senderName, pars
       if (parsedCv?.location && !existingRef.location) updates.location = parsedCv.location;
       if (parsedCv?.qualification && !existingRef.qualification) updates.qualification = parsedCv.qualification;
 
-      await updateCandidateStatus(cleanCvPhone, updates);
+      if (Object.keys(updates).length > 0) {
+        await updateCandidateStatus(cleanCvPhone, updates);
+      }
       await appendNote(cleanCvPhone, refNote);
       console.log(`✅ [CandidateGraph] Updated existing candidate with referral: ${cvName} (${cleanCvPhone})`);
     } else {
-      // Create new candidate in RecrutOS Supabase
+      // Create new candidate in RecrutOS Supabase (Note: ros_candidates schema has no referred_by column; provenance is stored in notes)
       const newPayload = {
         name: cvName,
         phone: cleanCvPhone,
@@ -339,7 +352,6 @@ export async function handleReferralResume(client, senderPhone, senderName, pars
         last_company: parsedCv?.last_company || '',
         qualification: parsedCv?.qualification || 'Graduate',
         process_status: 'Need to Talk',
-        referred_by: `${senderName} (${cleanSenderPhone})`,
         notes: refNote
       };
 
@@ -370,10 +382,23 @@ export async function handleReferralResume(client, senderPhone, senderName, pars
         phone: cleanCvPhone,
         date: new Date().toISOString()
       },
-      reference_culture_pitched: true
+      reference_culture_pitched: true,
+      pending_referral: null
     }).catch(() => {});
 
     await appendNote(cleanSenderPhone, `[Reference Sourced] ${senderName} shared resume of ${cvName} (📱 ${cleanCvPhone}). Saved to RecrutOS.`);
+  } else {
+    // Missing phone number on CV! Store pending referral in knowledge graph
+    await updateCandidateGraphNode(cleanSenderPhone, {
+      pending_referral: {
+        name: cvName,
+        parsedCv: parsedCv,
+        timestamp: Date.now()
+      },
+      reference_culture_pitched: true
+    }).catch(() => {});
+
+    await appendNote(cleanSenderPhone, `[Reference Sourced - Pending Phone] ${senderName} shared resume of ${cvName} without contact number. Bot requested phone number.`);
   }
 
   // Notify Trainer & Saa Office
@@ -386,7 +411,7 @@ export async function handleReferralResume(client, senderPhone, senderName, pars
         `🤝 *Referred by:* ${senderName} (📱 ${cleanSenderPhone})\n` +
         `📍 ${parsedCv?.location || 'Mumbai'} | 💼 ${parsedCv?.experience || 'N/A'} ${parsedCv?.years ? `(${parsedCv.years}y)` : ''}\n` +
         `🏢 Last Co: ${parsedCv?.last_company || 'N/A'} | 💰 Salary: ₹${parsedCv?.inhand_salary || 'N/A'}/mo\n` +
-        `👉 *Auto-saved to RecrutOS database!*`;
+        `👉 *${cleanCvPhone ? 'Auto-saved to RecrutOS database!' : 'Awaiting contact phone number'}*`;
       await notifyTrainerAndOffice(client, refAlert);
     } catch (_) {}
   }
@@ -410,6 +435,44 @@ export async function handleReferralResume(client, senderPhone, senderName, pars
     candidateId: targetCandId,
     ackText
   };
+}
+
+/**
+ * Detects if a sender with a pending referral just provided a phone number,
+ * and if so, completes the candidate creation in RecrutOS.
+ */
+export async function checkAndResolvePendingReferral(client, senderPhone, senderName, rawText) {
+  const cleanSenderPhone = normalizePhone(senderPhone);
+  if (!cleanSenderPhone || !rawText) return null;
+
+  const node = await getOrCreateCandidateNode(cleanSenderPhone);
+  if (!node || !node.pending_referral) return null;
+
+  const pending = node.pending_referral;
+  // If pending referral is older than 4 hours, ignore
+  if (Date.now() - (pending.timestamp || 0) > 4 * 60 * 60 * 1000) {
+    node.pending_referral = null;
+    persistGraphState();
+    return null;
+  }
+
+  // Look for 10-digit Indian phone number
+  const phoneMatch = rawText.match(/\b(?:(?:\+?91[\s-]?)?([6-9]\d{9}))\b/);
+  if (!phoneMatch) return null;
+
+  const extractedPhone = phoneMatch[1];
+  if (extractedPhone === cleanSenderPhone) return null; // Don't match sender's own phone
+
+  console.log(`🎯 [CandidateGraph] Resolved phone number ${extractedPhone} for pending referral "${pending.name}" from ${senderName}`);
+
+  const updatedCv = { ...(pending.parsedCv || {}), phone: extractedPhone, name: pending.name };
+  await handleReferralResume(client, cleanSenderPhone, senderName, updatedCv, rawText);
+
+  node.pending_referral = null;
+  persistGraphState();
+
+  const senderFirstName = (senderName || 'bhai').split(' ')[0];
+  return `Number mil gaya! *${pending.name}* (📱 ${extractedPhone}) ko RecrutOS mein add kar diya hai aur interview lineup ke liye contact kar rahe hain. Thanks a lot ${senderFirstName} bhai! 🙌`;
 }
 
 
