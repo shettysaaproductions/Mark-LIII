@@ -108,6 +108,8 @@ import {
   handleReferralResume,
   checkAndResolvePendingReferral
 } from './candidate_graph.js';
+import { parseLineupDate } from './date_resolver.js';
+import { startRecrutOSSyncWindow } from './recrutos_sync_window.js';
 
 
 // ── Startup cleanup — kill stale Chrome/lockfile from previous run ──────────
@@ -904,6 +906,9 @@ client.on('ready', async () => {
   // ── Start the autonomous scheduler ──────────────────────────────────────
   startScheduler(client);
 
+  // ── Start RecrutOS Live Intelligence Window (Tracks Boss manual edits & call notes) ──
+  startRecrutOSSyncWindow();
+
   // ── Pattern Learner — reads real RecrutOS notes, rebuilds AI training ────
   // Runs on startup then every 6 hours. AI always trained on latest data.
   try {
@@ -1593,22 +1598,25 @@ async function handleIncomingMessage(msg, overrideText = null) {
       if (extracted.currently_working && extracted.currently_working !== existingCand.currently_working && !existingCand.currently_working) {
         colUpdates.currently_working = extracted.currently_working;
       }
-      // 10. Placement / Joining Status
-      const hasNegativeJoining = /\b(?:nhi|nahi|not|won'?t|cannot|can'?t|cooling|cooling\s*period)\b/i.test(lowerReply);
-      if (!hasNegativeJoining) {
-        if (/\b(?:yes.*join|can join|joining today|ready to join|will join|join kar(?:unga|ungi)?|already joined)\b/i.test(lowerReply)) {
-          if (existingCand.joined_status !== 'Yes') colUpdates.joined_status = 'Yes';
-        }
-        if (/\b(?:wipro.*humana|selected.*wipro|joining.*wipro|confirm.*humana)\b/i.test(lowerReply)) {
-          if (existingCand.joined_status !== 'Yes') colUpdates.joined_status = 'Yes';
-          if (existingCand.joined_company !== 'Wipro Humana') colUpdates.joined_company = 'Wipro Humana';
-        }
+      // 10. Placement / Joining Status & Selection Status:
+      // STRICT DIRECTIVE FROM USER: Bot NEVER automatically sets joined_status or select_status.
+      // Joining and selection are 100% human recruiter / Boss manual decisions only!
+      // If candidate expresses willingness or possibility to join, log remark in notes ONLY.
+      if (/\b(?:will join|can join|ready to join|immediately join|join kar(?:unga|ungi)|joining possible|join kar lunga|immediately join b kar lunga)\b/i.test(lowerReply)) {
+        console.log(`ℹ️ [CandidateRemark] Candidate expressed willingness to join: "${rawText.slice(0, 60)}" (Status strictly reserved for manual recruiter action)`);
+        await appendNote(existingCand.phone, `[Candidate Remark] Willingness to join / immediate joiner expressed on WhatsApp: "${rawText.slice(0, 100)}"`);
       } else if (extracted.cooling_period) {
         await appendNote(existingCand.phone, '[Cooling Period] Candidate mentioned cooling period active — cannot rejoin immediately.');
       }
 
-      // 11. Interview Lineup Status
-      if (/available.*tomorrow|aaunga|interview.*attend|ready for interview|available today|walkin|walk-in/i.test(lowerReply)) {
+      // 11. Interview Lineup Status & Date Rescheduling
+      const parsedDate = parseLineupDate(lowerReply, new Date());
+      if (parsedDate) {
+        console.log(`📅 [DateDetected] Candidate confirmed interview date: ${parsedDate.dateStr} (${parsedDate.dayName}) from "${rawText}"`);
+        colUpdates.interview_date = parsedDate.dateStr;
+        colUpdates.lineup_status = 'Yes';
+        await appendNote(existingCand.phone, `[Lineup Scheduled] Interview date updated to ${parsedDate.dayName} (${parsedDate.dateStr}) on candidate confirmation.`);
+      } else if (/\b(?:available.*tomorrow|aaunga|interview.*attend|ready for interview|available today|walkin|walk-in|slot lock|schedule kar(?:o|do))\b/i.test(lowerReply)) {
         if (existingCand.lineup_status !== 'Yes') colUpdates.lineup_status = 'Yes';
       }
 
@@ -1624,9 +1632,9 @@ async function handleIncomingMessage(msg, overrideText = null) {
         await appendNote(existingCand.phone, `[WhatsApp Update] ${Object.entries(colUpdates).map(([k, v]) => `${k}: ${v}`).join(', ')}`);
       }
 
-      // If candidate confirmed joining or interview, alert Shetty Saa in Shetty Office chat
-      if (colUpdates.joined_status || colUpdates.lineup_status) {
-        const alertMsg = `🔔 *Candidate WhatsApp Status Update!*\n━━━━━━━━━━━━━━━━━━━━━━\n👤 *${existingCand.name}* (📱 ${existingCand.phone})\n💼 Process: ${existingCand.process || 'Voice'} | 📍 ${existingCand.location || 'Mumbai'}\n💬 *Reply:* "${rawText}"\n${colUpdates.joined_status ? '🎉 Status: *Joined = Yes*\n' : ''}${colUpdates.lineup_status ? '✅ Status: *Lineup Confirmed*\n' : ''}📝 Live synced to RecrutOS Supabase notes & columns.`;
+      // If candidate confirmed interview date or lineup, alert Shetty Saa in Shetty Office chat
+      if (colUpdates.interview_date || colUpdates.lineup_status) {
+        const alertMsg = `🔔 *Candidate WhatsApp Lineup Update!*\n━━━━━━━━━━━━━━━━━━━━━━\n👤 *${existingCand.name}* (📱 ${existingCand.phone})\n💼 Process: ${existingCand.process || 'Voice'} | 📍 ${existingCand.location || 'Mumbai'}\n💬 *Reply:* "${rawText}"\n${colUpdates.interview_date ? `📅 Date: *${colUpdates.interview_date}*\n` : ''}${colUpdates.lineup_status ? '✅ Status: *Lineup Confirmed*\n' : ''}📝 Live synced to RecrutOS Supabase notes & columns.`;
         await notifyTrainerAndOffice(client, alertMsg);
       }
 

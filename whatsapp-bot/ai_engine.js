@@ -224,7 +224,7 @@ Next to ask: ${step} — ask this ONE field naturally, like a real human recruit
     const candComp = chatAnalysis?.placedCompany || existingCand?.joined_company || '';
     const candLineup = existingCand?.lineup_status === 'Yes' || chatAnalysis?.isLinedUp;
     const candLineupDate = existingCand?.interview_date || chatAnalysis?.lineupDate || '';
-    const notesSummary = existingCand?.notes ? existingCand.notes.slice(0, 200).replace(/\n/g, ' ') : '';
+    const notesSummary = existingCand?.notes ? existingCand.notes.slice(0, 1500).trim() : '';
 
     // Fix bot-generated placeholder names
     const isPlaceholderName = ['hii','hi','hello','hey','unknown','friend','na','n/a','null','undefined','ask name','lead','candidate'].some(p => (candName||'').toLowerCase().trim().startsWith(p));
@@ -245,9 +245,16 @@ Next to ask: ${step} — ask this ONE field naturally, like a real human recruit
 - Process: ${candProc || '⚠️ NOT SET — ask them'}
 - Last Salary: ₹${candSal}/mo
 ${candLastCo ? `- Last Company: ${candLastCo}` : ''}
-${notesSummary ? `- Notes: ${notesSummary}` : ''}
+${candLineupDate ? `- Confirmed Interview Date: ${candLineupDate}` : ''}
 =========================================
 
+${notesSummary ? `=== 🚨 BOSS / RECRUITER LIVE UPDATES FROM RECRUTOS ===
+${notesSummary}
+=====================================================
+⚠️ STRICT DIRECTIVE FOR BOT:
+The notes above contain the latest instructions, call remarks, and decisions entered by the Boss/Recruiter directly in RecrutOS (e.g. from phone calls or manual review).
+You MUST 100% RESPECT AND ALIGN with the Boss's notes! If the Boss noted "day shift only" or "interview on Wednesday 7th Oct", YOU MUST NEVER contradict or re-ask what the recruiter already decided. Acknowledge and proceed seamlessly based on the recruiter's updates!
+` : ''}
 🧠 SMART RULES FOR KNOWN CANDIDATES:
 1. ${isPlaceholderName ? 'CRITICAL: The saved name is an unverified placeholder. DO NOT call them by this name! Address them warmly ("Hey!", "Sun na") and ask: "btw tera naam kya hai?"' : `You KNOW this person — address them by first name (${candName.split(' ')[0]}), be warm and personal.`}
 2. NEVER ask details that are already saved (Name, Location, Experience, Salary) unless they contradict what you know.
@@ -255,7 +262,8 @@ ${notesSummary ? `- Notes: ${notesSummary}` : ''}
 4. NEVER send a generic greeting like "Welcome to Mumbai Job Alerts" or "Are you looking for a job?".
 5. If something critical is MISSING (marked ⚠️ above), ask it naturally once.
 6. If candidate says something that conflicts with saved data, gently confirm: "Oh wait, you mentioned 28k now — last time it was 22k, should I update that?"
-${missingFields.length > 0 ? `7. MISSING INFO — if conversation allows, casually ask: ${missingFields.join(', ')}` : ''}
+7. STATUS LOCK: Joining status and Selection status are strictly human recruiter decisions. Never assume or mark a candidate as joined unless confirmed in recruiter notes.
+${missingFields.length > 0 ? `8. MISSING INFO — if conversation allows, casually ask: ${missingFields.join(', ')}` : ''}
 `;
   }
 
