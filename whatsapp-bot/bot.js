@@ -103,8 +103,11 @@ import {
   getOrCreateCandidateNode,
   updateCandidateGraphNode,
   syncResumeToGraph,
-  handleBossSidewaysInteraction
+  handleBossSidewaysInteraction,
+  isReferralResume,
+  handleReferralResume
 } from './candidate_graph.js';
+
 
 // ── Startup cleanup — kill stale Chrome/lockfile from previous run ──────────
 try {
@@ -1226,6 +1229,27 @@ async function handleIncomingMessage(msg, overrideText = null) {
 
           // ALWAYS use WhatsApp sender phone — never let it be empty
           const senderPhone = candidatePhone || phoneFromWaId(talkerId);
+          const senderName = contactName || 'Friend';
+
+          // ── MULTI-RESUME & REFERRAL DETECTION LAW ─────────────────────────
+          // If the resume has a different phone number or name from the sender,
+          // OR sender text indicates a referral, treat as an independent referral!
+          const referralResult = isReferralResume(
+            senderPhone,
+            senderName,
+            parsed?.phone,
+            parsed?.name,
+            rawText || '',
+            existingCand
+          );
+
+          if (referralResult.isReferral) {
+            console.log(`🤝 [Referral] Resume from ${senderName} (${senderPhone}) is a referral for ${parsed?.name || 'Candidate'} (${parsed?.phone || 'No phone'}) [Reason: ${referralResult.reason}]`);
+            const outcome = await handleReferralResume(client, senderPhone, senderName, parsed, rawText);
+            await safeSend(msg, outcome.ackText);
+            return;
+          }
+
           const resolvedName = (parsed?.name && isLikelyName(parsed.name)) ? parsed.name : (isLikelyName(contactName) ? contactName : `Candidate ${senderPhone.slice(-4)}`);
 
           // Sync to Candidate Knowledge Graph (provenance & state)
@@ -1236,6 +1260,7 @@ async function handleIncomingMessage(msg, overrideText = null) {
 
           // Check if candidate already exists (by WhatsApp phone — always reliable)
           const existingMatches = senderPhone ? await searchCandidate(senderPhone) : [];
+
 
           if (existingMatches && existingMatches.length > 0) {
             // ── UPDATE existing candidate ─────────────────────────────────────
