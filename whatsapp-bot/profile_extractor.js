@@ -108,9 +108,11 @@ export function extractAllProfileFields(text) {
     extracted.process = 'Chat / Non-Voice';
   }
 
-  // 5. Salary
-  const salPattern = /(?:salary|inhand|in-hand|ctc|drawn|package)?\s*(?:₹|rs\.?|inr)?\s*(\d{1,2}(?:\.\d+)?\s*k|\d{4,6})\b/i;
-  const salMatch = lower.match(salPattern);
+  // 5. Salary (strip email addresses first so e.g. sameershaikh9288@gmail.com doesn't trigger 9288)
+  const noEmails = lower.replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '');
+  const salPattern = /(?:salary|inhand|in-hand|ctc|drawn|package|take\s*home|kamata|milta)?\s*(?:₹|rs\.?|inr)?\s*(\d{1,2}(?:\.\d+)?\s*k|\b\d{4,6}\b)/i;
+  const hasSalKeyword = /(?:salary|inhand|in-hand|ctc|drawn|package|take\s*home|₹|rs\.?|inr|kamata|milta)/i.test(noEmails);
+  const salMatch = noEmails.match(salPattern);
   if (salMatch && !salMatch[0].includes('year') && !salMatch[0].includes('month')) {
     const rawVal = salMatch[1].replace(/\s+/g, '');
     if (rawVal.endsWith('k')) {
@@ -119,7 +121,7 @@ export function extractAllProfileFields(text) {
         extracted.salary = String(Math.round(num * 1000));
         extracted.inhand_salary = extracted.salary;
       }
-    } else {
+    } else if (hasSalKeyword) {
       const num = parseInt(rawVal, 10);
       if (!isNaN(num) && num >= 8000 && num <= 250000) {
         extracted.salary = String(num);
