@@ -227,18 +227,18 @@ Next to ask: ${step} — ask this ONE field naturally, like a real human recruit
     const notesSummary = existingCand?.notes ? existingCand.notes.slice(0, 200).replace(/\n/g, ' ') : '';
 
     // Fix bot-generated placeholder names
-    const isPlaceholderName = ['hii','hi','hello','hey','unknown','friend','na','n/a','null','undefined'].includes((candName||'').toLowerCase().trim());
+    const isPlaceholderName = ['hii','hi','hello','hey','unknown','friend','na','n/a','null','undefined','ask name','lead','candidate'].some(p => (candName||'').toLowerCase().trim().startsWith(p));
 
     // Identify what's missing from their profile so you can ask naturally
     const missingFields = [];
-    if (isPlaceholderName) missingFields.push('full name — the name saved looks auto-generated, ask naturally: "btw naam kya hai tera?"');
+    if (isPlaceholderName) missingFields.push('full name — the name saved looks auto-generated or missing, DO NOT call them "Hii" or "Ask Name"! Address them warmly without a name and ask naturally: "btw tera naam kya hai?"');
     if (!candProc) missingFields.push('process type (Voice/Chat/Backend)');
     if (!candSal || candSal === 'N/A') missingFields.push('current in-hand salary');
     if (!candLoc || candLoc === 'Mumbai') missingFields.push('exact location / area');
 
     existingBlock = `
 === THIS CANDIDATE'S RECRUTOS PROFILE ===
-- Name: ${candName}${candPhone ? ` | Phone: ${candPhone}` : ''}
+- Name: ${isPlaceholderName ? '[Name Unverified — Ask naturally]' : candName}${candPhone ? ` | Phone: ${candPhone}` : ''}
 - Status: ${candJoined ? `✅ PLACED/JOINED${candComp ? ` at ${candComp}` : ''}` : (candLineup ? `📅 LINED UP${candLineupDate ? ` for ${candLineupDate}` : ''}` : '🔍 ACTIVE — being placed')}
 - Location: ${candLoc}
 - Experience: ${candExp}${candYears ? ` (${candYears} yrs)` : ''}
@@ -249,11 +249,11 @@ ${notesSummary ? `- Notes: ${notesSummary}` : ''}
 =========================================
 
 🧠 SMART RULES FOR KNOWN CANDIDATES:
-1. You KNOW this person — address them by first name (${candName.split(' ')[0]}), be warm and personal.
+1. ${isPlaceholderName ? 'CRITICAL: The saved name is an unverified placeholder. DO NOT call them by this name! Address them warmly ("Hey!", "Sun na") and ask: "btw tera naam kya hai?"' : `You KNOW this person — address them by first name (${candName.split(' ')[0]}), be warm and personal.`}
 2. NEVER ask details that are already saved (Name, Location, Experience, Salary) unless they contradict what you know.
 3. NEVER restart intake or treat them as a new stranger.
 4. NEVER send a generic greeting like "Welcome to Mumbai Job Alerts" or "Are you looking for a job?".
-5. If something critical is MISSING (marked ⚠️ above), ask it naturally once: "Hey, just checking — what kind of process were you in? Voice or chat?"
+5. If something critical is MISSING (marked ⚠️ above), ask it naturally once.
 6. If candidate says something that conflicts with saved data, gently confirm: "Oh wait, you mentioned 28k now — last time it was 22k, should I update that?"
 ${missingFields.length > 0 ? `7. MISSING INFO — if conversation allows, casually ask: ${missingFields.join(', ')}` : ''}
 `;
