@@ -13,8 +13,9 @@ import { getClient, isDbConnected } from './recruiter_db.js';
 import { updateCandidateGraphNode, getOrCreateCandidateNode } from './candidate_graph.js';
 
 let _lastSyncTime = new Date(Date.now() - 5 * 60 * 1000).toISOString(); // initial 5 min lookback
-const _cachedCandidates = new Map(); // phone -> { notes, interview_date, lineup_status, updated_at }
+const _cachedCandidates = new Map(); // phone -> { name, notes, interview_date, lineup_status, joined_status, select_status, process, location, updated_at }
 let _syncInterval = null;
+let _isInitialBoot = true;
 
 /**
  * Initializes the RecrutOS Intelligence Window polling loop.
@@ -72,7 +73,10 @@ export async function pollRecrutOSChanges() {
       return [];
     }
 
-    if (!updatedList || updatedList.length === 0) return [];
+    if (!updatedList || updatedList.length === 0) {
+      _isInitialBoot = false;
+      return [];
+    }
 
     for (const cand of updatedList) {
       const cleanPhone = String(cand.phone || '').replace(/\D/g, '').slice(-10);
@@ -82,18 +86,28 @@ export async function pollRecrutOSChanges() {
       const changes = [];
 
       if (!cached) {
-        // First time seeing this candidate in this session
-        _cachedCandidates.set(cleanPhone, {
-          notes: cand.notes,
-          interview_date: cand.interview_date,
-          lineup_status: cand.lineup_status,
-          joined_status: cand.joined_status,
-          updated_at: cand.updated_at
-        });
+        if (_isInitialBoot) {
+          // Warmup on bot boot: populate initial cache without printing diffs
+          _cachedCandidates.set(cleanPhone, {
+            name: cand.name,
+            notes: cand.notes,
+            interview_date: cand.interview_date,
+            lineup_status: cand.lineup_status,
+            joined_status: cand.joined_status,
+            select_status: cand.select_status,
+            process: cand.process,
+            location: cand.location,
+            updated_at: cand.updated_at
+          });
+          continue;
+        }
+
+        // Post-boot edit: Candidate was just updated or added in RecrutOS by recruiter!
+        changes.push(`Recruiter modified candidate in RecrutOS: Notes: "${(cand.notes || '').slice(0, 80)}" | Lineup: ${cand.lineup_status || 'No'} | Date: ${cand.interview_date || 'None'}`);
       } else {
-        // Compare what changed
+        // Precise field-by-field diff
         if (cached.notes !== cand.notes) {
-          changes.push(`Notes updated: "${(cand.notes || '').slice(0, 70)}..."`);
+          changes.push(`Notes updated: "${(cand.notes || '').slice(0, 80)}..."`);
         }
         if (cached.interview_date !== cand.interview_date) {
           changes.push(`Interview Date changed: ${cached.interview_date || 'None'} → ${cand.interview_date || 'None'}`);
@@ -104,37 +118,52 @@ export async function pollRecrutOSChanges() {
         if (cached.joined_status !== cand.joined_status) {
           changes.push(`Joined: ${cached.joined_status || 'No'} → ${cand.joined_status}`);
         }
-
-        // Update cache
-        _cachedCandidates.set(cleanPhone, {
-          notes: cand.notes,
-          interview_date: cand.interview_date,
-          lineup_status: cand.lineup_status,
-          joined_status: cand.joined_status,
-          updated_at: cand.updated_at
-        });
-
-        if (changes.length > 0) {
-          console.log(`\n🔄 [RecrutOS Window] Recruiter edit detected for ${cand.name} (${cleanPhone}):`);
-          changes.forEach(ch => console.log(`   • ${ch}`));
-
-          // Immediately sync changes to Candidate Knowledge Graph
-          await updateCandidateGraphNode(cleanPhone, {
-            name: cand.name,
-            location: cand.location,
-            process: cand.process,
-            experience: cand.experience,
-            years: cand.years,
-            inhand_salary: cand.inhand_salary,
-            last_company: cand.last_company
-          }).catch(() => {});
+        if (cached.select_status !== cand.select_status) {
+          changes.push(`Selection: ${cached.select_status || 'No'} → ${cand.select_status}`);
         }
+        if (cached.process !== cand.process) {
+          changes.push(`Process: ${cached.process || 'N/A'} → ${cand.process}`);
+        }
+        if (cached.location !== cand.location) {
+          changes.push(`Location: ${cached.location || 'N/A'} → ${cand.location}`);
+        }
+      }
+
+      // Update cache
+      _cachedCandidates.set(cleanPhone, {
+        name: cand.name,
+        notes: cand.notes,
+        interview_date: cand.interview_date,
+        lineup_status: cand.lineup_status,
+        joined_status: cand.joined_status,
+        select_status: cand.select_status,
+        process: cand.process,
+        location: cand.location,
+        updated_at: cand.updated_at
+      });
+
+      if (changes.length > 0) {
+        console.log(`\n🔄 [RecrutOS Window] Recruiter edit detected for ${cand.name} (${cleanPhone}):`);
+        changes.forEach(ch => console.log(`   • ${ch}`));
+
+        // Immediately sync changes to Candidate Knowledge Graph
+        await updateCandidateGraphNode(cleanPhone, {
+          name: cand.name,
+          location: cand.location,
+          process: cand.process,
+          experience: cand.experience,
+          years: cand.years,
+          inhand_salary: cand.inhand_salary,
+          last_company: cand.last_company
+        }).catch(() => {});
       }
     }
 
+    _isInitialBoot = false;
     return updatedList;
   } catch (err) {
     console.warn('[RecrutOS Window] Exception during poll:', err.message);
+    _isInitialBoot = false;
     return [];
   }
 }
