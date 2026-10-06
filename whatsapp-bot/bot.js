@@ -61,6 +61,7 @@ import {
   searchCandidate,
   updateCandidateStatus,
   appendNote,
+  updateOrganizedBotNote,
   addLineupFollowup,
   addToDnd,
   removeFromDnd,
@@ -1628,8 +1629,11 @@ async function handleIncomingMessage(msg, overrideText = null) {
         updateNotice = ` [Updated: ${Object.entries(colUpdates).map(([k, v]) => `${k}=${v}`).join(', ')}]`;
         console.log(`💾 [CandidateSync] Live updated Supabase columns for ${existingCand.name}:`, colUpdates);
 
-        // Only append note to Supabase if there are meaningful profile/column updates
-        await appendNote(existingCand.phone, `[WhatsApp Update] ${Object.entries(colUpdates).map(([k, v]) => `${k}: ${v}`).join(', ')}`);
+        // Update single clean organized Bot Summary block in RecrutOS notes (prevents fragmented note spam)
+        await updateOrganizedBotNote(existingCand.phone, {
+          summaryLine: `Status: ${colUpdates.lineup_status === 'Yes' ? `Lineup Confirmed (${colUpdates.interview_date || 'Date TBD'})` : (existingCand.process || 'Active Lead')}${colUpdates.inhand_salary ? ` · CTC: ₹${colUpdates.inhand_salary}` : ''}`,
+          lastChatSnippet: `Cand: "${rawText ? rawText.slice(0, 90).replace(/\n/g, ' ') : ''}" → ${Object.entries(colUpdates).map(([k,v]) => `${k}=${v}`).join(', ')}`
+        });
       }
 
       // If candidate confirmed interview date or lineup, alert Shetty Saa in Shetty Office chat
@@ -1808,6 +1812,15 @@ async function handleIncomingMessage(msg, overrideText = null) {
   try {
     const chatObj = await msg.getChat().catch(() => null);
     if (chatObj) await chatObj.sendStateTyping().catch(() => {});
+
+    // HUMAN REALISM DELAY: 5 to 9 seconds
+    // Simulates a real human recruiter reading the message and typing on phone
+    if (!senderIsRecruiter && !isShettyOfficeGroup) {
+      const delayMs = Math.floor(Math.random() * 4000) + 5000; // 5000ms - 9000ms (5 to 9s)
+      console.log(`⏳ [HumanTyping] Natural pause of ${(delayMs / 1000).toFixed(1)}s for ${contactName}...`);
+      await new Promise(r => setTimeout(r, delayMs));
+      if (chatObj) await chatObj.sendStateTyping().catch(() => {});
+    }
 
     const reply = await askAI(
       talkerId,

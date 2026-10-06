@@ -193,15 +193,16 @@ def _load_onnx_session(log=print) -> bool:
         log("[Laya] Loading ONNX session…")
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = min(4, (os.cpu_count() or 2))
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
 
         sess = ort.InferenceSession(
             str(_ONNX_PATH),
             sess_options=opts,
             providers=["CPUExecutionProvider"],
         )
-        tok_path = str(_TOKENIZER) if _TOKENIZER.exists() else _MODEL_ID
-        tok = AutoTokenizer.from_pretrained(tok_path)
+        tok_dir = _TOKENIZER if _TOKENIZER.exists() else (_MODELS_DIR / "hf" / "tokenizer")
+        tok_path = str(tok_dir) if tok_dir.exists() else _MODEL_ID
+        tok = AutoTokenizer.from_pretrained(tok_path, local_files_only=tok_dir.exists())
 
         with _model_lock:
             _session    = sess

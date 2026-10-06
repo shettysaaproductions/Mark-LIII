@@ -280,11 +280,18 @@ ${missingFields.length > 0 ? `8. MISSING INFO — if conversation allows, casual
       : `This sender is a NEW JOB CANDIDATE. Guide them warmly — like a real recruiter, not a chatbot. Ask ONE question at a time.`);
 
   return `
-You are Saa — WhatsApp voice of Shetty Productions, Mumbai. Text like a real person, not a bot.
+You are Saa — WhatsApp voice of Shetty Productions, Mumbai. Text like a busy, friendly Mumbai recruiter chatting on WhatsApp from a phone, NOT an AI bot.
 User: ${userName || 'Friend'}
 ${genderNote}
 
 ROLE: ${roleContext}
+
+⚡ STRICT HUMAN REALISM & LENGTH RULES (CRITICAL):
+1. LENGTH: Exactly 1 to 2 SHORT sentences MAX (under 25-35 words total).
+2. NEVER write long paragraphs, bullet lists, or robotic pleasantries.
+3. Chat like a real person texting on WhatsApp: crisp, warm, direct Hinglish.
+4. Ask at most ONE simple question at a time.
+5. Example: "Bhai current in-hand salary kitna mil raha hai?" or "Kal 11 baje Malad walk-in possible hai?"
 
 ${CORE_RECRUITER_KNOWLEDGE}
 
@@ -367,9 +374,9 @@ export async function askAI(userId, userPrompt = '', userName = 'Friend', mediaP
     systemInstruction: { parts: [{ text: systemInstructionText }] },
     contents: contentsPayload,
     generationConfig: {
-      temperature: 0.78,   // slightly higher = more natural variation, less robotic
-      maxOutputTokens: 280, // shorter = more WhatsApp-like
-      topP: 0.92,
+      temperature: 0.72,   // balanced realism
+      maxOutputTokens: 85, // strictly 1-2 short conversational sentences
+      topP: 0.90,
     },
   };
 
@@ -398,9 +405,17 @@ export async function askAI(userId, userPrompt = '', userName = 'Friend', mediaP
       }
 
       const data = await response.json();
-      const replyText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      let replyText = data.candidates?.[0]?.content?.parts?.[0]?.text;
 
       if (replyText) {
+        // Enforce concise recruiter length for general candidate chats
+        if (!isRecruiter) {
+          const sentences = replyText.replace(/\n+/g, ' ').split(/(?<=[.!?])\s+/).filter(s => s.trim());
+          if (sentences.length > 2) {
+            replyText = sentences.slice(0, 2).join(' ').trim();
+          }
+        }
+
         // Persist to conversation history (store compact text so we don't keep MB of base64)
         const historyText = mediaParts.length > 0
           ? `[User sent a file/attachment]: ${promptText}`
