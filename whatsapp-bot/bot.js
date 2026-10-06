@@ -1638,9 +1638,22 @@ async function handleIncomingMessage(msg, overrideText = null) {
         await notifyTrainerAndOffice(client, alertMsg);
       }
 
+      let actionTitle = 'Candidate WhatsApp Reply';
+      let actCategory = 'WHATSAPP';
+      if (colUpdates.interview_date) {
+        actionTitle = `Lineup Scheduled (${colUpdates.interview_date}) 📅`;
+        actCategory = 'RECRUTOS';
+      } else if (colUpdates.lineup_status === 'Yes') {
+        actionTitle = 'Lineup Confirmed ✅';
+        actCategory = 'RECRUTOS';
+      } else if (Object.keys(colUpdates).length > 0) {
+        actionTitle = 'Candidate Profile Updated ⚡';
+        actCategory = 'RECRUTOS';
+      }
+
       await logAgentActivity(client, {
-        action: 'Candidate WhatsApp Reply',
-        category: 'WHATSAPP',
+        action: actionTitle,
+        category: actCategory,
         candidateName: existingCand.name,
         candidatePhone: existingCand.phone,
         candidateId: existingCand.id,
@@ -1809,6 +1822,22 @@ async function handleIncomingMessage(msg, overrideText = null) {
     );
     await safeSend(msg, reply);
     console.log(`📤 [Reply → ${contactName}]: ${reply.slice(0, 80).replace(/\n/g, ' ')}...`);
+
+    // Log bot's outgoing coordination reply so RecrutOS live feed shows full dialogue
+    if (!senderIsRecruiter && !isShettyOfficeGroup && candidatePhone) {
+      const replyClean = reply.replace(/[*_~`]/g, '').trim();
+      const snippet = replyClean.length > 140 ? replyClean.slice(0, 140) + '...' : replyClean;
+      await logAgentActivity(client, {
+        action: 'Bot Coordinated Reply 🤖',
+        category: 'WHATSAPP',
+        candidateName: existingCand?.name || contactName,
+        candidatePhone: existingCand?.phone || candidatePhone,
+        candidateId: existingCand?.id || '',
+        details: `"${snippet}"`,
+        source: 'WhatsApp Bot AI',
+        notifyBoss: false,
+      }).catch(() => {});
+    }
   } catch (err) {
     console.error(`❌ AI error for ${contactName}:`, err.message);
     await safeSend(msg, `Sorry, I'm having a technical issue right now. Please try again in a moment. 🙏`);

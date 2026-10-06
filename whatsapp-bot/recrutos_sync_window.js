@@ -11,6 +11,7 @@
 
 import { getClient, isDbConnected } from './recruiter_db.js';
 import { updateCandidateGraphNode, getOrCreateCandidateNode } from './candidate_graph.js';
+import { logAgentActivity } from './activity_log.js';
 
 let _lastSyncTime = new Date(Date.now() - 5 * 60 * 1000).toISOString(); // initial 5 min lookback
 const _cachedCandidates = new Map(); // phone -> { name, notes, interview_date, lineup_status, joined_status, select_status, process, location, updated_at }
@@ -155,6 +156,18 @@ export async function pollRecrutOSChanges() {
           years: cand.years,
           inhand_salary: cand.inhand_salary,
           last_company: cand.last_company
+        }).catch(() => {});
+
+        // Log to activity feed so RecrutOS notification feed reflects recruiter changes live
+        logAgentActivity(null, {
+          action: 'Recruiter Update Synced 🔄',
+          category: 'RECRUTOS',
+          candidateName: cand.name,
+          candidatePhone: cleanPhone,
+          candidateId: cand.id,
+          details: changes.join(' · '),
+          source: 'RecrutOS Sync Window',
+          notifyBoss: false
         }).catch(() => {});
       }
     }
