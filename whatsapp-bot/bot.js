@@ -1118,12 +1118,37 @@ async function handleIncomingMessage(msg, overrideText = null) {
     return;
   }
 
+  // ── Verified / Enterprise / Corporate Account Guard ──────────────────────
+  // Catches verified business accounts, official green-tick accounts, enterprise senders,
+  // e-commerce brands (Amazon, Flipkart, Swiggy, Zomato, banks, etc.).
+  // These must NEVER be saved as candidates or receive auto-replies.
+  const isCorporateAccount =
+    Boolean(contact?.isEnterprise) ||
+    Boolean(contact?.isVerified) ||
+    Boolean(contact?.verifiedName) ||
+    /amazon|flipkart|myntra|swiggy|zomato|blinkit|zepto|bigbasket|dunzo|meesho|ajio|jio\s*mart|tataneu|nykaa|uber|ola|rapido|paytm|phonepe|gpay|google\s*pay|cred|hdfc|icici|sbi|axis|kotak|airtel|vi\s*service|vodafone|domino|mcdonald|kfc|pizza\s*hut/i.test(contactName || '') ||
+    /amazon|flipkart|myntra|swiggy|zomato|blinkit|zepto|bigbasket|dunzo|meesho|ajio|jio\s*mart|tataneu|nykaa|uber|ola|rapido|paytm|phonepe|gpay|google\s*pay|cred|hdfc|icici|sbi|axis|kotak|airtel|vi\s*service|vodafone|domino|mcdonald|kfc|pizza\s*hut/i.test(contactSavedName || '') ||
+    /amazon|flipkart|myntra|swiggy|zomato|blinkit|zepto|bigbasket|dunzo|meesho|ajio|jio\s*mart|tataneu|nykaa|uber|ola|rapido|paytm|phonepe|gpay|google\s*pay|cred|hdfc|icici|sbi|axis|kotak|airtel|vi\s*service|vodafone|domino|mcdonald|kfc|pizza\s*hut/i.test(contactPushName || '');
+
+  if (isCorporateAccount) {
+    console.log(`🏢 [CorporateGuard] Blocked message from corporate/verified account: ${contact?.verifiedName || contactName} (${candidatePhone || talkerId})`);
+    if (candidatePhone) {
+      addToDnd(candidatePhone);
+      protectContact(candidatePhone, contact?.verifiedName || contactName || 'Corporate Account', 'Automated corporate/promotional sender');
+    }
+    return;
+  }
+
   // ── Spam / Auto-Reply / System Message Guard ─────────────────────────────
   // CRITICAL: These messages must NEVER get a reply or be saved as candidates.
   // Catches: marketing, bank alerts, OTPs, auto-replies, delivery, govt msgs.
   const rawTextForSpam = (msg.body || '');
   if (rawTextForSpam) {
     const SPAM_PATTERNS = [
+      // E-commerce / shopping / delivery / promotional cashback
+      /amazon\.(in|com)|amzn\.to|flipkart\.com|fkrt\.it|swiggy\.(com|in)|zomato\.com|zmt\.me|blinkit\.com|zepto\.in|bigbasket\.com|meesho\.com|myntra\.com|ajio\.com/i,
+      /shop again|order\s*=\s*more savings|assured cashback|cashback|flat\s*\u20b9?\s*\d+\s*off|use code\s+[a-z0-9]+|cart value|free delivery on orders/i,
+      /track your order|order dispatched|delivered by|out for delivery|your order has been|your order is/i,
       // Auto-replies
       /thank you for (getting in touch|contacting|reaching out|your (message|enquiry|query|interest))/i,
       /this is an auto(mated)?\s*(reply|response|message|notification)/i,
@@ -1147,7 +1172,7 @@ async function handleIncomingMessage(msg, overrideText = null) {
       /limited\s*time\s*offer|exclusive\s*offer|special\s*offer/i,
       /\b(CODE:|code:)\s*[A-Z0-9]{4,}/,
       // Delivery / logistics
-      /out for delivery|expected delivery|track your (order|shipment|parcel)/i,
+      /expected delivery|track your (order|shipment|parcel)/i,
       /shipment.{0,30}(dispatched|shipped|delivered|delayed)/i,
       // Govt / UIDAI / EPFO
       /uidai|aadhar|aadhaar|pan card|epf\s*balance|epfo/i,
@@ -1156,6 +1181,9 @@ async function handleIncomingMessage(msg, overrideText = null) {
     ];
     if (SPAM_PATTERNS.some(p => p.test(rawTextForSpam))) {
       console.log(`🚫 [Spam/AutoReply] Blocked from ${talkerId}: "${rawTextForSpam.slice(0, 60).replace(/\n/g, ' ')}"`);
+      if (candidatePhone) {
+        addToDnd(candidatePhone);
+      }
       return;
     }
     // Drop messages that START with auto-reply phrases (catches edge cases)
@@ -1453,6 +1481,20 @@ async function handleIncomingMessage(msg, overrideText = null) {
         }
       }
     }
+
+    // 3. Strict Check: If candidate is muted, blacklisted, or bot-blocked in RecrutOS, ignore!
+    if (existingCand) {
+      const notesLower = (existingCand.notes || '').toLowerCase();
+      const isCandMutedOrBlocked =
+        existingCand.blacklist === 'Yes' ||
+        notesLower.includes('[muted by shetty saa]') ||
+        notesLower.includes('[bot blocked') ||
+        notesLower.includes('[dnd]');
+      if (isCandMutedOrBlocked) {
+        console.log(`🔕 [BotBlocked] Ignoring message from ${existingCand.name} (${existingCand.phone}) — candidate is marked muted/blocked in RecrutOS.`);
+        return;
+      }
+    }
   }
 
   // ── PENDING REFERRAL PHONE NUMBER RESOLUTION ─────────────────────────────
@@ -1486,7 +1528,7 @@ async function handleIncomingMessage(msg, overrideText = null) {
   // ── AUTO-CREATE NEW USER IN RECRUTOS SUPABASE ─────────────────────────────
   // If candidate is NOT in Supabase database, create a new record immediately
   // before talking to them, so all future details and notes sync directly to RecrutOS.
-  if (!senderIsRecruiter && !isShettyOfficeGroup && !existingCand) {
+  if (!senderIsRecruiter && !isShettyOfficeGroup && !existingCand && !isCorporateAccount) {
     const rawDigits = cleanPhone(candidatePhone) || (candidatePhone ? candidatePhone.replace(/\D/g, '').slice(-10) : '');
     if (rawDigits && /^[6-9]\d{9}$/.test(rawDigits)) {
       try {

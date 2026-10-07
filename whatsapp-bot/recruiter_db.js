@@ -102,6 +102,22 @@ function saveDndList(set) {
 }
 
 const _dndList = loadDndList();
+let _lastDndMtime = 0;
+
+function getDndSet() {
+  try {
+    if (fs.existsSync(DND_PATH)) {
+      const stats = fs.statSync(DND_PATH);
+      if (stats.mtimeMs !== _lastDndMtime) {
+        _lastDndMtime = stats.mtimeMs;
+        const fresh = loadDndList();
+        _dndList.clear();
+        fresh.forEach(p => _dndList.add(p));
+      }
+    }
+  } catch (_) {}
+  return _dndList;
+}
 
 export function addToDnd(phone) {
   const clean = cleanPhone(phone);
@@ -143,7 +159,7 @@ export function removeFromDnd(phone) {
 
 export function isOnDnd(phone) {
   const clean = cleanPhone(phone);
-  return clean ? _dndList.has(clean) : false;
+  return clean ? getDndSet().has(clean) : false;
 }
 
 // ── Recruiter Numbers ────────────────────────────────────────────────────────
