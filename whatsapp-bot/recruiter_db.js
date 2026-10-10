@@ -119,25 +119,112 @@ function getDndSet() {
   return _dndList;
 }
 
+export async function syncDndFromSupabase() {
+  try {
+    const sb = getClient();
+    if (!sb) return false;
+
+    // 1. Fetch from ros_user_preferences
+    const { data: prefData } = await sb
+      .from('ros_user_preferences')
+      .select('preference_value')
+      .eq('user_id', 'system')
+      .eq('preference_key', 'bot_dnd_phones')
+      .maybeSingle();
+
+    const prefPhones = Array.isArray(prefData?.preference_value?.phones)
+      ? prefData.preference_value.phones
+      : [];
+
+    // 2. Fetch candidates with [Bot Blocked] or [Muted by Shetty Saa] in notes
+    const { data: cands } = await sb
+      .from('ros_candidates')
+      .select('phone, notes')
+      .or('notes.ilike.%[Bot Blocked%,notes.ilike.%[Muted by Shetty Saa%')
+      .or('is_trash.is.null,is_trash.eq.false')
+      .limit(300);
+
+    const blockedFromNotes = [];
+    const unblockedPhones = [];
+
+    (cands || []).forEach(c => {
+      const clean = cleanPhone(c.phone);
+      if (!clean) return;
+      const notes = (c.notes || '').toLowerCase();
+      const blockedIdx = Math.max(
+        notes.indexOf('[bot blocked'),
+        notes.indexOf('[muted by shetty saa]'),
+        notes.indexOf('[dnd]')
+      );
+      const unblockedIdx = Math.max(
+        notes.indexOf('[bot unblocked'),
+        notes.indexOf('[unmuted')
+      );
+      if (blockedIdx !== -1 && (unblockedIdx === -1 || blockedIdx < unblockedIdx)) {
+        blockedFromNotes.push(clean);
+      } else if (unblockedIdx !== -1 && unblockedIdx < blockedIdx) {
+        unblockedPhones.push(clean);
+      }
+    });
+
+    let changed = false;
+    for (const p of [...prefPhones, ...blockedFromNotes]) {
+      const cp = cleanPhone(p);
+      if (cp && !_dndList.has(cp)) {
+        _dndList.add(cp);
+        changed = true;
+      }
+    }
+
+    for (const p of unblockedPhones) {
+      if (!prefPhones.includes(p) && _dndList.has(p)) {
+        _dndList.delete(p);
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      saveDndList(_dndList);
+      console.log(`[RecruiterDB] 🔄 Synced DND from Supabase — ${_dndList.size} contacts now muted/blocked`);
+    }
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+// Initial sync on load & recurring 15s sync to stay 100% updated with RecrutOS
+syncDndFromSupabase();
+setInterval(syncDndFromSupabase, 15000);
+
 export function addToDnd(phone) {
   const clean = cleanPhone(phone);
   if (clean && clean.length === 10) {
     _dndList.add(clean);
     saveDndList(_dndList);
 
-    // Sync note to Supabase ros_candidates asynchronously
+    // Sync to Supabase ros_user_preferences and ros_candidates notes
     (async () => {
       try {
         const sb = getClient();
         if (sb) {
+          const currentPhones = [..._dndList];
+          await sb.from('ros_user_preferences').upsert({
+            user_id: 'system',
+            preference_key: 'bot_dnd_phones',
+            preference_value: { phones: currentPhones },
+            updated_at: new Date().toISOString()
+          }, { onConflict: 'user_id,preference_key' });
+
           const { data } = await sb.from('ros_candidates')
             .select('id, notes')
             .or(`phone.eq.${clean},phone.eq.91${clean},phone.eq.+91 ${clean}`)
             .limit(1);
           if (data && data[0]) {
             const existing = data[0].notes || '';
-            if (!existing.includes('Muted by Shetty Saa')) {
-              const updated = `[${new Date().toISOString().slice(0, 10)}] [Muted by Shetty Saa] Outreach paused by recruiter.\n${existing}`;
+            const ts = new Date().toISOString().slice(0, 16).replace('T', ' ');
+            if (!existing.includes('[Bot Blocked by RecrutOS]') && !existing.includes('[Muted by Shetty Saa]')) {
+              const updated = `[${ts}] [Bot Blocked by RecrutOS] Bot messaging & replies disabled manually.\n${existing}`;
               await sb.from('ros_candidates').update({ notes: updated.trim() }).eq('id', data[0].id);
             }
           }
@@ -153,7 +240,36 @@ export function addToDnd(phone) {
 export function removeFromDnd(phone) {
   const clean = cleanPhone(phone);
   const removed = clean ? _dndList.delete(clean) : false;
-  if (removed) saveDndList(_dndList);
+  if (removed) {
+    saveDndList(_dndList);
+    (async () => {
+      try {
+        const sb = getClient();
+        if (sb) {
+          const currentPhones = [..._dndList];
+          await sb.from('ros_user_preferences').upsert({
+            user_id: 'system',
+            preference_key: 'bot_dnd_phones',
+            preference_value: { phones: currentPhones },
+            updated_at: new Date().toISOString()
+          }, { onConflict: 'user_id,preference_key' });
+
+          const { data } = await sb.from('ros_candidates')
+            .select('id, notes')
+            .or(`phone.eq.${clean},phone.eq.91${clean},phone.eq.+91 ${clean}`)
+            .limit(1);
+          if (data && data[0]) {
+            const ts = new Date().toISOString().slice(0, 16).replace('T', ' ');
+            let existingNotes = (data[0].notes || '')
+              .replace(/\[\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}\]\s*\[Bot Blocked by RecrutOS\].*?\n?/gi, '')
+              .replace(/\[\d{4}-\d{2}-\d{2}(?:\s\d{2}:\d{2})?\]\s*\[(?:Saa Office\]\s*\[)?Muted by Shetty Saa\].*?\n?/gi, '');
+            const updated = `[${ts}] [Bot Unblocked by RecrutOS] Bot messaging & replies restored manually.\n${existingNotes}`;
+            await sb.from('ros_candidates').update({ notes: updated.trim() }).eq('id', data[0].id);
+          }
+        }
+      } catch (_) {}
+    })();
+  }
   return removed;
 }
 

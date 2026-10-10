@@ -69,6 +69,7 @@ function buildProtectedSet() {
   return new Set(all.map(c => String(c.phone).replace(/\D/g, '').slice(-10)).filter(p => p.length === 10));
 }
 
+const _protected = buildProtectedSet();
 let _lastProtMtime = 0;
 function getProtectedSet() {
   try {
