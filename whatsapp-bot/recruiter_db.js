@@ -315,9 +315,8 @@ export function cleanPhone(rawPhone) {
 export function buildPhoneSearchFilter(rawPhone) {
   const digits = String(rawPhone || '').replace(/\D/g, '').slice(-10);
   if (digits.length === 10) {
-    const p1 = digits.slice(0, 5);
-    const p2 = digits.slice(5);
-    return `phone.ilike.%${digits}%,phone.ilike.%${p1}%${p2}%`;
+    const wild = '%' + digits.split('').join('%') + '%';
+    return `phone.ilike.${wild}`;
   }
   if (digits.length >= 6) {
     return `phone.ilike.%${digits}%`;
@@ -379,14 +378,18 @@ export async function addCandidateToRecrutOS(candidateData) {
   }
 
   // ── GUARD 3: Dedup — don't create duplicate if phone already exists ────────
-  const { data: existing } = await client
+  const { data: existingCandidates } = await client
     .from('ros_candidates')
-    .select('id, name, phone')
-    .or(buildPhoneSearchFilter(rawPhone))
-    .limit(1);
-  if (existing && existing.length > 0) {
-    console.log(`[RecruiterDB] ⚠️ Duplicate — ${rawPhone} already exists as "${existing[0].name}" (ID: ${existing[0].id}). Skipping insert.`);
-    return { success: true, data: existing[0], duplicate: true };
+    .select('id, name, phone, is_trash')
+    .or('is_trash.is.null,is_trash.eq.false')
+    .or(buildPhoneSearchFilter(rawPhone));
+  const existing = (existingCandidates || []).find(c => {
+    const d = String(c.phone || '').replace(/\D/g, '');
+    return d.slice(-10) === rawPhone && !c.is_trash;
+  });
+  if (existing) {
+    console.log(`[RecruiterDB] ⚠️ Duplicate — ${rawPhone} already exists as "${existing.name}" (${existing.phone}) (ID: ${existing.id}). Skipping insert.`);
+    return { success: true, data: existing, duplicate: true };
   }
 
   const timestamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
@@ -417,6 +420,26 @@ export async function addCandidateToRecrutOS(candidateData) {
     return { success: false, error: error.message };
   }
   console.log(`[RecruiterDB] ✅ Candidate saved: ${row.name} (${row.phone}) ID: ${data.id}`);
+
+  // 🚀 Auto-purge matching candy logs
+  try {
+    const wild = '%' + rawPhone.split('').join('%') + '%';
+    const { data: candyMatches } = await client
+      .from('ros_candy_updates')
+      .select('id, phone, name')
+      .ilike('phone', wild);
+    const targets = (candyMatches || []).filter(c => {
+      const d = String(c.phone || '').replace(/\D/g, '');
+      return d.length >= 10 && d.slice(-10) === rawPhone;
+    });
+    if (targets.length > 0) {
+      await client.from('ros_candy_updates').delete().in('id', targets.map(t => t.id));
+      console.log(`[RecruiterDB] 🗑️ Automatically purged ${targets.length} candy record(s) matching ${rawPhone}`);
+    }
+  } catch (err) {
+    console.error('[RecruiterDB] Error auto-purging candy:', err.message);
+  }
+
   return { success: true, data };
 }
 
