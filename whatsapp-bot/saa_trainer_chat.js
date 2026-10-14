@@ -289,9 +289,13 @@ export async function appendCandidateNote(identifier, note) {
   try {
     const isPhone = /^\d{7,}$/.test(identifier.replace(/\D/g, ''));
     let q = client.from('ros_candidates').select('id, name, phone, notes');
-    q = isPhone
-      ? q.ilike('phone', `%${identifier.replace(/\D/g, '').slice(-10)}%`)
-      : q.ilike('name', `%${identifier.trim()}%`);
+    if (isPhone) {
+      const p10 = identifier.replace(/\D/g, '').slice(-10);
+      const wild = '%' + p10.split('').join('%') + '%';
+      q = q.ilike('phone', wild);
+    } else {
+      q = q.ilike('name', `%${identifier.trim()}%`);
+    }
 
     const { data } = await q.limit(1);
     const candidate = data?.[0];
@@ -329,7 +333,8 @@ export async function findCandidateByNameOrPhone(identifier) {
 
     if (isPhone) {
       const phoneDigits = cleanId.replace(/\D/g, '').slice(-10);
-      q = q.ilike('phone', `%${phoneDigits}%`);
+      const wild = '%' + phoneDigits.split('').join('%') + '%';
+      q = q.ilike('phone', wild);
     } else {
       q = q.ilike('name', `%${cleanId}%`);
     }
@@ -544,6 +549,22 @@ export function updateTrainingMd(instruction, type = 'LIVE_UPDATE') {
 
 // ── Natural Language Understanding & Classification ──────────────────────────
 
+export function isMasterStopCommand(text) {
+  const lower = (text || '').toLowerCase().trim();
+  return (
+    /\b(stop\s+replying\s+(?:to\s+)?(?:everyone|everybody|all|anyone|anybody)|stop\s+all\s+(?:replies|messages?)|mute\s+(?:everyone|all)|pause\s+(?:everyone|all)|stop\s+msging\s+(?:anyone|everyone|any\s+candidates?)|stop\s+auto\s*replying|pause\s+auto\s*replying|pause\s+candidate\s+messaging|stop\s+all\s+candidate\s+messages|stop\s+replying\s+to\s+candidates|mute\s+all\s+candidates|stop\s+bot\s+replies|only\s+(?:talk|reply)\s+to\s+me|apart\s+from\s+only\s+trainer)\b/i.test(lower) ||
+    /^(?:hey\s+|yo\s+|bot\s+|saa\s+)?(?:stop|stopp|pause|halt|mute|shut)\s+(?:replying|messaging|texting|auto\s*replying|auto\s*reply|msging|bot)?\s*(?:to\s+)?(?:everyone|everybody|anyone|anybody|all|inbox|candidates?)?$/i.test(lower)
+  );
+}
+
+export function isMasterResumeCommand(text) {
+  const lower = (text || '').toLowerCase().trim();
+  return (
+    /\b(reply\s+all|reply\s+everyone|reply\s+to\s+all|reply\s+to\s+everyone|start\s+replying\s+everyone|start\s+replying\s+all|resume\s+replying\s+everyone|resume\s+replying\s+all|start\s+msging\s+everyone|resume\s+msging\s+everyone|resume\s+auto\s*replying|start\s+auto\s*replying|resume\s+msging\s+candidates|start\s+msging\s+candidates|resume\s+candidate\s+messaging|start\s+candidate\s+messages|enable\s+auto\s*replying|unpause\s+auto\s*replying|unpause\s+all)\b/i.test(lower) ||
+    /^(?:hey\s+|yo\s+|bot\s+|saa\s+)?(?:reply|resume|start|enable|unpause)\s+(?:all|everyone|everybody|replying|auto\s*replying|auto\s*reply|msging|messaging|texting|bot)?\s*(?:to\s+)?(?:everyone|everybody|anyone|anybody|all|candidates?|replies)?$/i.test(lower)
+  );
+}
+
 export function classifyIntent(text) {
   const t = text.toLowerCase().trim();
 
@@ -557,14 +578,20 @@ export function classifyIntent(text) {
     return 'greeting';
   }
 
+  // 0B. Global Master Commands (Pause / Resume all candidate replies)
+  if (isMasterStopCommand(t)) return 'master_stop';
+  if (isMasterResumeCommand(t)) return 'master_resume';
+
   // 1. Candidate search (Higher priority than mute if 'find/search/show' is present)
   if (/find|search|list|show|who are|fetch|get all|give me|candidates in|candidates from/i.test(t)) {
     return 'search';
   }
 
-  // 2. Mute / pause / blacklist candidate outreach ("dont msg ganesh...", "stop replying abdul...", "blacklist 8591577476", "mute 7304537510")
-  if (/(?:don+t?|don.?t|do\s+not|stop|pause|mute|blacklist|block)\s+(?:replying|reply|messaging|texting|msg|message|text|whatsapp|contacting|calling)?\s*(?:to\s+)?([a-zA-Z0-9\+\s]+)/i.test(t) ||
-      /^(?:blacklist|block|mute)\s+([a-zA-Z0-9\+\s]+)/i.test(t)) {
+  // 2. Mute / pause / blacklist single candidate outreach ("dont msg ganesh...", "stop replying abdul...", "blacklist 8591577476", "mute 7304537510")
+  if (!/(?:everyone|everybody|anyone|anybody|\ball\b)/i.test(t) && (
+      /(?:don+t?|don.?t|do\s+not|stop|pause|mute|blacklist|block)\s+(?:replying|reply|messaging|texting|msg|message|text|whatsapp|contacting|calling)?\s*(?:to\s+)?([a-zA-Z0-9\+\s]+)/i.test(t) ||
+      /^(?:blacklist|block|mute)\s+([a-zA-Z0-9\+\s]+)/i.test(t)
+  )) {
     return 'mute_candidate';
   }
 
@@ -1375,6 +1402,216 @@ export async function handleForwardJDToOverdue(jdContent, waClient, todayStr) {
     `\n\n📝 RecrutOS candidate notes updated live. You will be alerted when they reply! 🚀`;
 }
 
+// ── Broadcast to All Candidates ("msg all ...") ──────────────────────────────
+/**
+ * Detects if a message is a mass broadcast command intended for ALL candidates
+ * in RecrutOS (e.g. "msg all\n\nHappy Navratri", "message all", "broadcast all").
+ * Note: Excludes "text all today" which targets today's interview lineup.
+ */
+export function isMsgAllCommand(text) {
+  const t = (text || '').trim();
+  if (/^(?:text|msg|remind|inform)\s+all\s+today/i.test(t)) return false;
+  return /^\s*(?:msg|message|text|send|broadcast)\s+(?:to\s+)?(?:all\s+candidates?|all|everyone|everybody)(?:\s+candidates?)?\b/i.test(t);
+}
+
+/**
+ * Extracts the exact message payload following "msg all" or "message all".
+ * Strips the trigger phrase, colons, dashes, and leading newlines so only
+ * the intended message (e.g. "Happy Navratri to you nd your family.") is delivered.
+ */
+export function extractMsgAllPayload(text) {
+  if (!isMsgAllCommand(text)) return '';
+  const t = (text || '').trim();
+  const match = t.match(/^\s*(?:msg|message|text|send|broadcast)\s+(?:to\s+)?(?:all\s+candidates?|all|everyone|everybody)(?:\s+candidates?)?\b(?:\s*[:\-\n]|\s+)?([\s\S]*)$/i);
+  if (!match) return '';
+  let payload = (match[1] || '').trim();
+  payload = payload.replace(/^(?:msg|message|text|send|broadcast)\s+(?:to\s+)?(?:all\s+candidates?|all|everyone|everybody)(?:\s+candidates?)?[:\s\n-]*/i, '').trim();
+  return payload;
+}
+
+/**
+ * Queries all active, non-trashed, non-blacklisted candidates across all sections in RecrutOS.
+ * Deduplicates strictly by the last 10 digits of their phone number.
+ */
+export async function getAllRecrutOSCandidates() {
+  const client = getClient();
+  if (!client) {
+    console.warn('[BroadcastAll] Supabase client unavailable');
+    return [];
+  }
+
+  try {
+    const { data, error } = await client.from('ros_candidates')
+      .select('id, name, phone, blacklist, is_trash, process, location')
+      .or('is_trash.is.null,is_trash.eq.false')
+      .order('created_at', { ascending: false })
+      .limit(5000);
+
+    if (error) {
+      console.error('[BroadcastAll] Supabase query error:', error.message);
+      return [];
+    }
+
+    const map = new Map();
+    for (const c of (data || [])) {
+      if (String(c.blacklist || '').toLowerCase() === 'yes') continue;
+      const clean10 = String(c.phone || '').replace(/\D/g, '').slice(-10);
+      if (clean10.length === 10 && !map.has(clean10)) {
+        map.set(clean10, {
+          id: c.id,
+          name: (c.name || 'Candidate').trim(),
+          phone: clean10,
+          location: c.location || '',
+          process: c.process || ''
+        });
+      }
+    }
+    return Array.from(map.values());
+  } catch (err) {
+    console.error('[BroadcastAll] Exception getting candidates:', err.message);
+    return [];
+  }
+}
+
+/**
+ * Executes a mass broadcast to ALL candidates saved in RecrutOS with anti-ban pacing.
+ * Returns an instant acknowledgment to the trainer and dispatches in the background.
+ */
+export async function handleBroadcastToAllCandidates(text, waClient, context = {}) {
+  const payload = extractMsgAllPayload(text);
+
+  if (!payload || payload.length < 2) {
+    return (
+      `⚠️ *Please provide the message to broadcast to all candidates!*\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `Send your command like this:\n\n` +
+      `*msg all*\n` +
+      `*Happy Navratri to you nd your family.*\n\n` +
+      `💡 _The bot will automatically send the exact message below 'msg all' to all candidates in RecrutOS without sending 'msg all'._`
+    );
+  }
+
+  // Fetch all unique candidates from RecrutOS Supabase
+  const targets = await getAllRecrutOSCandidates();
+  const totalCount = targets.length;
+
+  if (totalCount === 0) {
+    return `ℹ️ *No Eligible Candidates Found*\n━━━━━━━━━━━━━━━━━━━━━━\nFound 0 active non-blacklisted candidates with valid 10-digit phone numbers in RecrutOS.`;
+  }
+
+  if (!waClient) {
+    return (
+      `⚠️ *WhatsApp Client Offline*\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `Found *${totalCount} active candidates* across all sections in RecrutOS ready for this broadcast.\n\n` +
+      `💬 *Pending Message:*\n"${payload}"\n\n` +
+      `_However, the WhatsApp client is not active right now. Please start the WhatsApp bot to send live messages._`
+    );
+  }
+
+  // Construct immediate confirmation report for the Trainer / Boss
+  const immediateAck =
+    `🚀 *Mass Broadcast Initiated to All Candidates!*\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `👥 Total Recipients: *${totalCount} candidates* (all sections in RecrutOS)\n` +
+    `💬 *Exact Message Being Sent:*\n"${payload}"\n\n` +
+    `⚡ *Status:* Background dispatch active with humanized anti-ban pacing (~1.5s - 2.5s per message).\n` +
+    `📱 Preview first recipients:\n` +
+    targets.slice(0, 4).map((c, i) => `${i + 1}. *${c.name}* (+91 ${c.phone})`).join('\n') +
+    (totalCount > 4 ? `\n_...and ${totalCount - 4} more candidates_\n` : '\n') +
+    `\n🔔 _I will send you live progress alerts every 50 messages and a final completion report right here once finished!_ 🎯`;
+
+  // Launch async background dispatch loop (unawaited so trainer chat gets instant response)
+  (async () => {
+    let sentCount = 0;
+    let failCount = 0;
+    const failedList = [];
+    console.log(`\n📢 [BroadcastAll] Starting broadcast of "${payload.slice(0, 40)}" to ${totalCount} candidates...`);
+
+    for (let i = 0; i < targets.length; i++) {
+      // Check if boss triggered master stop / pause during the broadcast
+      if (isAutoReplyPaused()) {
+        const pauseNotice =
+          `⏸️ *Broadcast Paused by Master Stop*\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `Broadcast halted after ${i}/${totalCount} candidates (${sentCount} sent, ${failCount} failed) because a master pause command was triggered.`;
+        if (context.groupChat) {
+          await context.groupChat.sendMessage(pauseNotice).catch(() => {});
+        } else {
+          const tId = context.talkerId || getTrainerWaId();
+          if (tId) await waClient.sendMessage(tId, pauseNotice).catch(() => {});
+        }
+        console.log(`[BroadcastAll] Paused after ${sentCount} sent.`);
+        return;
+      }
+
+      const cand = targets[i];
+      const waId = `91${cand.phone}@c.us`;
+      const firstName = (cand.name || 'there').trim().split(' ')[0];
+      const textForCand = payload.includes('{name}')
+        ? payload.replace(/{name}/gi, firstName)
+        : payload;
+
+      try {
+        await waClient.sendMessage(waId, textForCand);
+        sentCount++;
+      } catch (sendErr) {
+        failCount++;
+        failedList.push(`${cand.name} (${cand.phone})`);
+        console.warn(`[BroadcastAll] Failed to send to ${cand.phone}:`, sendErr.message);
+      }
+
+      // Append note in RecrutOS silently
+      try {
+        await appendCandidateNote(cand.phone, `[Broadcast Sent] "${payload.slice(0, 60)}"`);
+      } catch (_) {}
+
+      // Humanized anti-ban pacing (1.5s - 2.5s)
+      await new Promise(r => setTimeout(r, 1500 + Math.random() * 1000));
+
+      // Milestone progress update every 50 candidates
+      if ((i + 1) % 50 === 0 && (i + 1) < totalCount) {
+        const progressMsg = `📊 *Broadcast Progress*: Delivered to ${sentCount}/${totalCount} candidates (${failCount} failed so far)...`;
+        if (context.groupChat) {
+          await context.groupChat.sendMessage(progressMsg).catch(() => {});
+        } else {
+          const tId = context.talkerId || getTrainerWaId();
+          if (tId) await waClient.sendMessage(tId, progressMsg).catch(() => {});
+        }
+      }
+    }
+
+    // Final Completion Report to Boss / Trainer
+    const completionReport =
+      `🎉 *Mass Broadcast Completed to All Candidates!*\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `👥 Total Candidates Targeted: *${totalCount}*\n` +
+      `✅ Delivered: *${sentCount}*\n` +
+      (failCount > 0 ? `⚠️ Delivery Failed: *${failCount}* (${failedList.slice(0, 4).join(', ')}${failedList.length > 4 ? '...' : ''})\n` : `✨ 100% Delivery Success Rate!\n`) +
+      `💬 *Message Sent:*\n"${payload}"\n\n` +
+      `📋 All candidate notes logged in RecrutOS. Any candidate who replies will alert you live! 🚀`;
+
+    if (context.groupChat) {
+      await context.groupChat.sendMessage(completionReport).catch(() => {});
+    } else {
+      const tId = context.talkerId || getTrainerWaId();
+      if (tId) await waClient.sendMessage(tId, completionReport).catch(() => {});
+    }
+
+    await logAgentActivity(waClient, {
+      action: 'Mass Broadcast All Candidates',
+      category: 'WHATSAPP',
+      details: `Broadcasted "${payload.slice(0, 60)}" to ${sentCount}/${totalCount} candidates across RecrutOS.`,
+      source: 'Saa Trainer (Msg All Command)',
+      notifyBoss: false
+    });
+
+    console.log(`✅ [BroadcastAll] Finished. ${sentCount} sent, ${failCount} failed.`);
+  })().catch(err => console.error('[BroadcastAll] Fatal error in background loop:', err));
+
+  return immediateAck;
+}
+
 // ── Ingest JD from Mumbai Job Alerts / Chat with Upfront Clarifications ───────
 export function handleIngestJDWithClarifications(rawText, waClient) {
   const clean = rawText
@@ -1529,7 +1766,7 @@ async function handlePresentationUpdate(text, todayStr, waClient) {
  *   "Remove Shilpa / dropout"
  *   "On hold Rizwan"
  */
-async function parseDirectCommand(text, todayStr, waClient) {
+async function parseDirectCommand(text, todayStr, waClient, context = {}) {
   const t = text.trim();
   const lower = t.toLowerCase();
 
@@ -1540,6 +1777,14 @@ async function parseDirectCommand(text, todayStr, waClient) {
       (forgotten ? `🗑️ Forgotten previous candidate: *${forgotten}*\n` : '') +
       `🧹 Cleared active candidate context & temporary conversation memory.\n\n` +
       `Ready for fresh instructions! What would you like to do next? 🚀`;
+  }
+
+  // ── 00AA. MASS BROADCAST TO ALL CANDIDATES ("msg all ...") ─────────────────
+  // E.g. "msg all\n\nHappy Navratri to you nd your family."
+  // E.g. "msg all Happy Diwali to you and your family"
+  // E.g. "message all candidates\nBest wishes on Eid!"
+  if (isMsgAllCommand(t)) {
+    return handleBroadcastToAllCandidates(t, waClient, context);
   }
 
   // ── 00A. PRESENTATION UPDATES INGESTION ──────────────────────────────────────
@@ -1581,42 +1826,42 @@ async function parseDirectCommand(text, todayStr, waClient) {
     return getRecentActivityBriefing(15);
   }
 
-  // ── 0A. GLOBAL AUTO-REPLY PAUSE & RESUME ──────────────────────────────────
-  if (
-    /\b(stop msging any candidates|stop auto replying|pause auto replying|pause candidate messaging|stop all candidate messages|stop replying to candidates|mute all candidates|stop bot replies)\b/i.test(lower) ||
-    /^(stop|pause|halt)\s+(msging|messaging|replying|texting|auto\s*replying|auto\s*reply|bot)\s*(any\s+candidates?|all\s+candidates?|candidates?|replies)?$/i.test(lower)
-  ) {
-    setGlobalAutoReplyPaused(true);
+  // ── 0A. GLOBAL AUTO-REPLY PAUSE & RESUME (MASTER COMMANDS) ─────────────────
+  if (isMasterStopCommand(lower)) {
+    setGlobalAutoReplyPaused(true, 'Trainer master stop command');
     await logAgentActivity(waClient, {
-      action: 'Auto-Reply Paused',
+      action: 'Auto-Reply Paused (Master Stop)',
       category: 'SYSTEM',
-      details: 'Global automated candidate responses and scheduled outreach paused by Shetty Saa.',
+      details: 'Global automated candidate responses stopped by Shetty Saa. Only trainer will receive responses.',
       source: 'Saa Trainer',
       notifyBoss: true
     });
-    return `⏸️ *Automated Outreach Paused!*\n━━━━━━━━━━━━━━━━━━━━━━\n` +
-      `🛑 All automated candidate replies, greetings, intake questions, and scheduled follow-ups are now **PAUSED**.\n\n` +
+    return `⏸️ *Understood Boss! Stopped Replying to Everyone.*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `🛑 All automated replies to anyone in your inbox are now **COMPLETELY STOPPED**.\n` +
+      `👑 **Only listening and responding to you** (Trainer / Shetty Saa).\n\n` +
       `💡 *Current Mode:*\n` +
-      `• Candidates can still message you, and their replies are still auto-synced live to RecrutOS notes.\n` +
+      `• Messages from candidates will still be logged silently to RecrutOS, but the bot will NOT send a single message or reply back.\n` +
       `• You have 100% manual control over conversations without bot interference.\n\n` +
-      `Say *"resume auto replying"* or *"start msging candidates"* whenever you want me to resume.`;
+      `Say *"reply all"* or *"start replying everyone"* whenever you want me to resume.`;
   }
 
-  if (
-    /\b(resume auto replying|start auto replying|resume msging candidates|start msging candidates|resume candidate messaging|start candidate messages|enable auto replying|unpause auto replying)\b/i.test(lower) ||
-    /^(resume|start|enable|unpause)\s+(msging|messaging|replying|texting|auto\s*replying|auto\s*reply|bot)\s*(any\s+candidates?|all\s+candidates?|candidates?|replies)?$/i.test(lower)
-  ) {
-    setGlobalAutoReplyPaused(false);
+  if (isMasterResumeCommand(lower)) {
+    setGlobalAutoReplyPaused(false, 'Trainer reply all command');
     await logAgentActivity(waClient, {
-      action: 'Auto-Reply Resumed',
+      action: 'Auto-Reply Resumed (Reply All)',
       category: 'SYSTEM',
-      details: 'Global automated candidate responses and scheduled outreach resumed by Shetty Saa.',
+      details: 'Global automated candidate responses resumed in strict recruitment mode by Shetty Saa.',
       source: 'Saa Trainer',
       notifyBoss: true
     });
-    return `▶️ *Automated Outreach Resumed!*\n━━━━━━━━━━━━━━━━━━━━━━\n` +
-      `✅ Autonomous candidate intake, profile matching, and scheduled interview follow-ups are now **ACTIVE**.\n\n` +
-      `_I will assist incoming candidates and keep RecrutOS synced live._ 🚀`;
+    return `▶️ *Understood Boss! 'Reply All' is now ACTIVE!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `🚀 Candidate auto-responses are now active in **Strict Recruitment Mode**:\n` +
+      `• Explaining Shetty is currently unavailable.\n` +
+      `• Requesting CV (*"Cv bhejo options check karta hu.."*).\n` +
+      `• Asking if currently working in 1-liner multi-message bursts.\n` +
+      `• Sharing job options, checking documents, and availability.\n` +
+      `• Directing ready candidates to call you directly to proceed with their interview!\n\n` +
+      `_Zero random topic chit-chat. 100% focused on candidate qualification._ 💼`;
   }
 
   // ── 0B. SEARCH CANDIDATES BY LOCATION & SHARE COMPANY JD ───────────────────
@@ -2897,6 +3142,14 @@ async function parseDirectCommand(text, todayStr, waClient) {
 }
 
 export async function handleTrainerChatMessage(text, waClient = null, context = {}) {
+  const todayStr = getISTDateString(0);
+  const ts = getISTTimeString();
+
+  // ── FAST PRE-PARSER (FIRST CHECK) — runs before ALL intent handlers & LLM ──────
+  // Master stop/resume ("stop replying everyone", "reply all"), lineup, joined commands
+  // bypass everything with zero API cost, instant 0ms latency, and 100% reliability.
+  const directResult = await parseDirectCommand(text, todayStr, waClient, context);
+  if (directResult !== null) return directResult;
 
   let intent = classifyIntent(text);
   if (intent === 'general') {
@@ -2911,16 +3164,8 @@ export async function handleTrainerChatMessage(text, waClient = null, context = 
     } catch (_) {}
   }
   const filters = extractFilters(text);
-  const todayStr = getISTDateString(0);
-  const ts = getISTTimeString();
 
   console.log(`🧠 [SaaTrainer] Intent: ${intent} | Filters: ${JSON.stringify(filters)} | Text: "${text.slice(0, 70)}"`);
-
-  // ── FAST PRE-PARSER (FIRST CHECK) — runs before ALL intent handlers ───────────
-  // Lineup / joined / no-show / dropout / on-hold commands bypass everything.
-  // Zero API cost, instant, 100% reliable regex matching on real boss phrases.
-  const directResult = await parseDirectCommand(text, todayStr, waClient);
-  if (directResult !== null) return directResult;
 
   // ── 0. BOSS GREETINGS ("Hi", "How are you") ──────────────────────────────
   if (intent === 'greeting') {
@@ -3481,6 +3726,9 @@ export async function handleTrainerChatMessage(text, waClient = null, context = 
 
   // ── 5. BULK OUTREACH ───────────────────────────────────────────────────────
   if (intent === 'bulk_action') {
+    if (isMsgAllCommand(text)) {
+      return handleBroadcastToAllCandidates(text, waClient, context);
+    }
     if (!waClient) return '⚠️ WhatsApp client not ready for sending bulk messages.';
 
     let targets = [];
@@ -3767,7 +4015,7 @@ CRITICAL RULES:
 
     if (!apiKey) throw new Error('No Gemini API key available for function calling');
 
-    const MODELS = ['gemini-3.5-flash-lite', 'gemini-3.7-flash', 'gemini-3.6-flash'];
+    const MODELS = ['gemini-3.1-flash-lite', 'gemini-3.5-flash-lite', 'gemini-3.7-flash', 'gemini-3.6-flash'];
 
     // ── Step 1: Call Gemini with function declarations ────────────────────────
     const userMessage = { role: 'user', parts: [{ text }] };
@@ -3783,7 +4031,7 @@ CRITICAL RULES:
     for (const model of MODELS) {
       try {
         const resp = await fetch(
-          `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${apiKey}`,
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
           { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload1) }
         );
         if (!resp.ok) continue;
@@ -3846,7 +4094,7 @@ CRITICAL RULES:
     for (const model of MODELS) {
       try {
         const resp = await fetch(
-          `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${apiKey}`,
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
           { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload2) }
         );
         if (!resp.ok) continue;
