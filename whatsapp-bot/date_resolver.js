@@ -69,15 +69,23 @@ export function parseLineupDate(text, referenceDate = null) {
   const currentYear = nowIST.getFullYear();
   const currentMonth = nowIST.getMonth(); // 0-indexed
   const currentWeekday = nowIST.getDay(); // 0 = Sun, 1 = Mon ...
+  const currentHour = nowIST.getHours();
+
+  // Late night / early morning before daytime office hours (00:00 to 06:59 IST):
+  // When candidates message post-midnight saying "tomorrow" / "kal" / "next day",
+  // they intend the upcoming morning/daytime of TODAY (since office interviews start ~10-11 AM).
+  // "Day after tomorrow" / "parso" during this window means the next day (tomorrow).
+  const isLateNightBeforeMorning = currentHour >= 0 && (currentHour < 7 || (currentHour < 9 && /\b(?:morning|subah)\b/i.test(raw)));
 
   // 1. "Day after tomorrow" / "parso" / "day after"
   if (/\b(?:day\s*after\s*tomorrow|day\s*after|parso|tarso)\b/i.test(raw)) {
+    const offset = isLateNightBeforeMorning ? 1 : 2;
     const target = new Date(nowIST);
-    target.setDate(target.getDate() + 2);
+    target.setDate(target.getDate() + offset);
     return {
       dateStr: formatDateISO(target),
       dayName: DAY_LABELS[target.getDay()],
-      rawMatch: 'day after'
+      rawMatch: isLateNightBeforeMorning ? 'day after (post-midnight -> tomorrow)' : 'day after'
     };
   }
 
@@ -85,12 +93,13 @@ export function parseLineupDate(text, referenceDate = null) {
   if (/\b(?:tomorrow|kal|next\s*day|nextday)\b/i.test(raw)) {
     // Distinguish "kal" from "aaj kal" or past tense if needed
     if (!/\b(?:aaj\s*kal|kal\s*(?:kiya\s*tha|gaya\s*tha|bola\s*tha))\b/i.test(raw)) {
+      const offset = isLateNightBeforeMorning ? 0 : 1;
       const target = new Date(nowIST);
-      target.setDate(target.getDate() + 1);
+      target.setDate(target.getDate() + offset);
       return {
         dateStr: formatDateISO(target),
         dayName: DAY_LABELS[target.getDay()],
-        rawMatch: 'tomorrow'
+        rawMatch: isLateNightBeforeMorning ? 'tomorrow (post-midnight -> today)' : 'tomorrow'
       };
     }
   }
