@@ -101,6 +101,7 @@ export function getLastDiscussedCandidate() {
 }
 
 export function resetSessionContext() {
+  clearPendingAllBroadcast();
   const prevCandidate = _lastDiscussedCandidate?.name || null;
   _lastDiscussedCandidate = null;
   console.log(`🔄 [SaaTrainer] Session context reset: Cleared last discussed candidate${prevCandidate ? ` (was: ${prevCandidate})` : ''}.`);
@@ -552,15 +553,16 @@ export function updateTrainingMd(instruction, type = 'LIVE_UPDATE') {
 export function isMasterStopCommand(text) {
   const lower = (text || '').toLowerCase().trim();
   return (
-    /\b(stop\s+replying\s+(?:to\s+)?(?:everyone|everybody|all|anyone|anybody)|stop\s+all\s+(?:replies|messages?)|mute\s+(?:everyone|all)|pause\s+(?:everyone|all)|stop\s+msging\s+(?:anyone|everyone|any\s+candidates?)|stop\s+auto\s*replying|pause\s+auto\s*replying|pause\s+candidate\s+messaging|stop\s+all\s+candidate\s+messages|stop\s+replying\s+to\s+candidates|mute\s+all\s+candidates|stop\s+bot\s+replies|only\s+(?:talk|reply)\s+to\s+me|apart\s+from\s+only\s+trainer)\b/i.test(lower) ||
-    /^(?:hey\s+|yo\s+|bot\s+|saa\s+)?(?:stop|stopp|pause|halt|mute|shut)\s+(?:replying|messaging|texting|auto\s*replying|auto\s*reply|msging|bot)?\s*(?:to\s+)?(?:everyone|everybody|anyone|anybody|all|inbox|candidates?)?$/i.test(lower)
+    /\b(stop\s+replying\s+(?:to\s+)?(?:everyone|everybody|all|anyone|anybody)|stop\s+replying\s+to\s+everyone\s+and\s+listen|listen\s+until|just\s+listen|only\s+listen|stop\s+all\s+(?:replies|messages?)|mute\s+(?:everyone|all)|pause\s+(?:everyone|all)|stop\s+msging\s+(?:anyone|everyone|any\s+candidates?)|stop\s+auto\s*replying|pause\s+auto\s*replying|pause\s+candidate\s+messaging|stop\s+all\s+candidate\s+messages|stop\s+replying\s+to\s+candidates|mute\s+all\s+candidates|stop\s+bot\s+replies|only\s+(?:talk|reply)\s+to\s+me|trainer\s+chat\s+should\s+only\s+reply\s+to\s+me|apart\s+from\s+only\s+trainer)\b/i.test(lower) ||
+    /^(?:hey\s+|yo\s+|bot\s+|saa\s+)?(?:stop|stopp|pause|halt|mute|shut)\s+(?:replying|messaging|texting|auto\s*replying|auto\s*reply|msging|bot)?\s*(?:to\s+)?(?:everyone|everybody|anyone|anybody|all|inbox|candidates?)?$/i.test(lower) ||
+    (/\bstop\s+replying\b/i.test(lower) && /\b(?:everyone|candidates?|all|incoming|listen)\b/i.test(lower))
   );
 }
 
 export function isMasterResumeCommand(text) {
   const lower = (text || '').toLowerCase().trim();
   return (
-    /\b(reply\s+all|reply\s+everyone|reply\s+to\s+all|reply\s+to\s+everyone|start\s+replying\s+everyone|start\s+replying\s+all|resume\s+replying\s+everyone|resume\s+replying\s+all|start\s+msging\s+everyone|resume\s+msging\s+everyone|resume\s+auto\s*replying|start\s+auto\s*replying|resume\s+msging\s+candidates|start\s+msging\s+candidates|resume\s+candidate\s+messaging|start\s+candidate\s+messages|enable\s+auto\s*replying|unpause\s+auto\s*replying|unpause\s+all)\b/i.test(lower) ||
+    /\b(reply\s+all|reply\s+everyone|reply\s+to\s+all|reply\s+to\s+everyone|start\s+replying\s+everyone|start\s+replying\s+all|start\s+replying|resume\s+replying\s+everyone|resume\s+replying\s+all|resume\s+replying|start\s+msging\s+everyone|resume\s+msging\s+everyone|resume\s+auto\s*replying|start\s+auto\s*replying|resume\s+msging\s+candidates|start\s+msging\s+candidates|resume\s+candidate\s+messaging|start\s+candidate\s+messages|enable\s+auto\s*replying|unpause\s+auto\s*replying|unpause\s+all|ask\s+the\s+trainer\s+to\s+(?:reply|start)|trainer\s+(?:start|resume)\s+replying)\b/i.test(lower) ||
     /^(?:hey\s+|yo\s+|bot\s+|saa\s+)?(?:reply|resume|start|enable|unpause)\s+(?:all|everyone|everybody|replying|auto\s*replying|auto\s*reply|msging|messaging|texting|bot)?\s*(?:to\s+)?(?:everyone|everybody|anyone|anybody|all|candidates?|replies)?$/i.test(lower)
   );
 }
@@ -1402,7 +1404,61 @@ export async function handleForwardJDToOverdue(jdContent, waClient, todayStr) {
     `\n\n📝 RecrutOS candidate notes updated live. You will be alerted when they reply! 🚀`;
 }
 
-// ── Broadcast to All Candidates ("msg all ...") ──────────────────────────────
+// ── Two-Step "Message All Candidates" Broadcast State & Logic ───────────────
+let _pendingAllBroadcast = null;
+let _isBroadcastInProgress = false;
+let _cancelActiveBroadcast = false;
+
+export function getPendingAllBroadcast() {
+  if (!_pendingAllBroadcast) return null;
+  // Auto-expire after 15 minutes of inactivity
+  if (Date.now() - _pendingAllBroadcast.timestamp > 15 * 60 * 1000) {
+    console.log('[BroadcastAll] Pending broadcast prompt expired after 15 minutes.');
+    _pendingAllBroadcast = null;
+    return null;
+  }
+  return _pendingAllBroadcast;
+}
+
+export function setPendingAllBroadcast(candidates) {
+  _pendingAllBroadcast = {
+    awaitingMessage: true,
+    candidateCount: candidates.length,
+    candidates,
+    timestamp: Date.now()
+  };
+  return _pendingAllBroadcast;
+}
+
+export function clearPendingAllBroadcast() {
+  const hadPending = !!_pendingAllBroadcast;
+  _pendingAllBroadcast = null;
+  return hadPending;
+}
+
+export function isBroadcastRunning() {
+  return _isBroadcastInProgress;
+}
+
+export function stopBroadcast() {
+  _cancelActiveBroadcast = true;
+  _pendingAllBroadcast = null;
+}
+
+/**
+ * Checks if incoming text is a cancel/stop command while awaiting broadcast text or during active run.
+ */
+export function isCancelBroadcastCommand(text) {
+  const t = (text || '').trim().toLowerCase();
+  if (/^(?:stop|cancel|abort|exit|close|nevermind|no|don'?t\s+send|discard)[.!]?$/i.test(t)) {
+    return true;
+  }
+  if (/^(?:stop|cancel|abort)\s+(?:it|this|that|now|please|command|broadcast|msg|message)[.!]?$/i.test(t)) {
+    return true;
+  }
+  return false;
+}
+
 /**
  * Detects if a message is a mass broadcast command intended for ALL candidates
  * in RecrutOS (e.g. "msg all\n\nHappy Navratri", "message all", "broadcast all").
@@ -1411,7 +1467,7 @@ export async function handleForwardJDToOverdue(jdContent, waClient, todayStr) {
 export function isMsgAllCommand(text) {
   const t = (text || '').trim();
   if (/^(?:text|msg|remind|inform)\s+all\s+today/i.test(t)) return false;
-  return /^\s*(?:msg|message|text|send|broadcast)\s+(?:to\s+)?(?:all\s+candidates?|all|everyone|everybody)(?:\s+candidates?)?\b/i.test(t);
+  return /^\s*(?:msg|message|text|send(?:\s+message|\s+msg)?|broadcast)\s+(?:to\s+)?(?:all\s+candidates?|all|everyone|everybody)(?:\s+candidates?)?\b/i.test(t);
 }
 
 /**
@@ -1422,10 +1478,11 @@ export function isMsgAllCommand(text) {
 export function extractMsgAllPayload(text) {
   if (!isMsgAllCommand(text)) return '';
   const t = (text || '').trim();
-  const match = t.match(/^\s*(?:msg|message|text|send|broadcast)\s+(?:to\s+)?(?:all\s+candidates?|all|everyone|everybody)(?:\s+candidates?)?\b(?:\s*[:\-\n]|\s+)?([\s\S]*)$/i);
+  const match = t.match(/^\s*(?:msg|message|text|send(?:\s+message|\s+msg)?|broadcast)\s+(?:to\s+)?(?:all\s+candidates?|all|everyone|everybody)(?:\s+candidates?)?\b(?:\s*[:\-\n]|\s+)?([\s\S]*)$/i);
   if (!match) return '';
   let payload = (match[1] || '').trim();
-  payload = payload.replace(/^(?:msg|message|text|send|broadcast)\s+(?:to\s+)?(?:all\s+candidates?|all|everyone|everybody)(?:\s+candidates?)?[:\s\n-]*/i, '').trim();
+  payload = payload.replace(/^(?:msg|message|text|send(?:\s+message|\s+msg)?|broadcast)\s+(?:to\s+)?(?:all\s+candidates?|all|everyone|everybody)(?:\s+candidates?)?[:\s\n-]*/i, '').trim();
+  if (/^(?:please|now|fast|today)$/i.test(payload)) return '';
   return payload;
 }
 
@@ -1474,22 +1531,152 @@ export async function getAllRecrutOSCandidates() {
 }
 
 /**
- * Executes a mass broadcast to ALL candidates saved in RecrutOS with anti-ban pacing.
- * Returns an instant acknowledgment to the trainer and dispatches in the background.
+ * Executes mass broadcast to candidate list with anti-ban pacing and live feedback.
+ */
+export async function executeBroadcastToCandidates(payload, targets, waClient, context = {}) {
+  const cleanPayload = (payload || '').trim();
+  const totalCount = targets?.length || 0;
+
+  if (totalCount === 0) {
+    return `ℹ️ *No Eligible Candidates Found*\n━━━━━━━━━━━━━━━━━━━━━━\nFound 0 active non-blacklisted candidates with valid 10-digit phone numbers in RecrutOS.`;
+  }
+
+  if (!cleanPayload || cleanPayload.length < 2) {
+    return `⚠️ *Please provide a valid message to broadcast!* (Minimum 2 characters).`;
+  }
+
+  if (!waClient) {
+    return (
+      `⚠️ *WhatsApp Client Offline*\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `Found *${totalCount} active candidates* across all sections in RecrutOS ready for this broadcast.\n\n` +
+      `💬 *Pending Message:*\n"${cleanPayload}"\n\n` +
+      `_However, the WhatsApp client is not active right now. Please start the WhatsApp bot to send live messages._`
+    );
+  }
+
+  _isBroadcastInProgress = true;
+  _cancelActiveBroadcast = false;
+
+  // Immediate acknowledgment to trainer
+  const immediateAck =
+    `🚀 *Mass Broadcast Initiated to All Candidates!*\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `👥 Total Recipients: *${totalCount} candidates* (all sections in RecrutOS)\n` +
+    `💬 *Exact Message Being Sent:*\n"${cleanPayload}"\n\n` +
+    `⚡ *Status:* Background dispatch active with humanized anti-ban pacing (~1.5s - 2.5s per message).\n` +
+    `📱 Preview first recipients:\n` +
+    targets.slice(0, 4).map((c, i) => `${i + 1}. *${c.name}* (+91 ${c.phone})`).join('\n') +
+    (totalCount > 4 ? `\n_...and ${totalCount - 4} more candidates_\n` : '\n') +
+    `\n🔔 _I will send you live progress alerts every 50 messages and a final completion report right here once finished!_ 🎯\n` +
+    `🛑 _(Reply *stop broadcast* at any time to abort remaining sends)_`;
+
+  // Launch async background dispatch loop (unawaited so trainer chat gets instant response)
+  (async () => {
+    let sentCount = 0;
+    let failCount = 0;
+    const failedList = [];
+    console.log(`\n📢 [BroadcastAll] Starting broadcast of "${cleanPayload.slice(0, 40)}" to ${totalCount} candidates...`);
+
+    try {
+      for (let i = 0; i < targets.length; i++) {
+        // Check if boss triggered cancel broadcast during the run
+        if (_cancelActiveBroadcast) {
+          const pauseNotice =
+            `🛑 *Broadcast Halted*\n` +
+            `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+            `Broadcast halted after ${i}/${totalCount} candidates (${sentCount} sent, ${failCount} failed). Reason: Stop broadcast command triggered by Shetty Saa.`;
+          if (context.groupChat) {
+            await context.groupChat.sendMessage(pauseNotice).catch(() => {});
+          } else {
+            const tId = context.talkerId || getTrainerWaId();
+            if (tId) await waClient.sendMessage(tId, pauseNotice).catch(() => {});
+          }
+          console.log(`[BroadcastAll] Halted after ${sentCount} sent. Reason: Stop broadcast triggered`);
+          return;
+        }
+
+        const cand = targets[i];
+        const waId = `91${cand.phone}@c.us`;
+        const firstName = (cand.name || 'there').trim().split(' ')[0];
+        const textForCand = cleanPayload.includes('{name}')
+          ? cleanPayload.replace(/{name}/gi, firstName)
+          : cleanPayload;
+
+        try {
+          await waClient.sendMessage(waId, textForCand);
+          sentCount++;
+        } catch (sendErr) {
+          failCount++;
+          failedList.push(`${cand.name} (${cand.phone})`);
+          console.warn(`[BroadcastAll] Failed to send to ${cand.phone}:`, sendErr.message);
+        }
+
+        // Append note in RecrutOS silently
+        try {
+          await appendCandidateNote(cand.phone, `[Broadcast Sent] "${cleanPayload.slice(0, 60)}"`);
+        } catch (_) {}
+
+        // Humanized anti-ban pacing (1.5s - 2.5s)
+        await new Promise(r => setTimeout(r, 1500 + Math.random() * 1000));
+
+        // Milestone progress update every 50 candidates
+        if ((i + 1) % 50 === 0 && (i + 1) < totalCount) {
+          const progressMsg = `📊 *Broadcast Progress*: Delivered to ${sentCount}/${totalCount} candidates (${failCount} failed so far)...`;
+          if (context.groupChat) {
+            await context.groupChat.sendMessage(progressMsg).catch(() => {});
+          } else {
+            const tId = context.talkerId || getTrainerWaId();
+            if (tId) await waClient.sendMessage(tId, progressMsg).catch(() => {});
+          }
+        }
+      }
+
+      // Final Completion Report to Boss / Trainer
+      const completionReport =
+        `🎉 *Mass Broadcast Completed to All Candidates!*\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `👥 Total Candidates Targeted: *${totalCount}*\n` +
+        `✅ Delivered: *${sentCount}*\n` +
+        (failCount > 0 ? `⚠️ Delivery Failed: *${failCount}* (${failedList.slice(0, 4).join(', ')}${failedList.length > 4 ? '...' : ''})\n` : `✨ 100% Delivery Success Rate!\n`) +
+        `💬 *Message Sent:*\n"${cleanPayload}"\n\n` +
+        `📋 All candidate notes logged in RecrutOS. Any candidate who replies will alert you live! 🚀`;
+
+      if (context.groupChat) {
+        await context.groupChat.sendMessage(completionReport).catch(() => {});
+      } else {
+        const tId = context.talkerId || getTrainerWaId();
+        if (tId) await waClient.sendMessage(tId, completionReport).catch(() => {});
+      }
+
+      await logAgentActivity(waClient, {
+        action: 'Mass Broadcast All Candidates',
+        category: 'WHATSAPP',
+        details: `Broadcasted "${cleanPayload.slice(0, 60)}" to ${sentCount}/${totalCount} candidates across RecrutOS.`,
+        source: 'Saa Trainer (Msg All Command)',
+        notifyBoss: false
+      });
+
+      console.log(`✅ [BroadcastAll] Finished. ${sentCount} sent, ${failCount} failed.`);
+    } finally {
+      _isBroadcastInProgress = false;
+      _cancelActiveBroadcast = false;
+    }
+  })().catch(err => {
+    _isBroadcastInProgress = false;
+    console.error('[BroadcastAll] Fatal error in background loop:', err);
+  });
+
+  return immediateAck;
+}
+
+/**
+ * Handles "message all" command.
+ * If payload is missing, queries candidates and prompts user with candidate count.
+ * If payload is provided in same message, executes broadcast immediately.
  */
 export async function handleBroadcastToAllCandidates(text, waClient, context = {}) {
   const payload = extractMsgAllPayload(text);
-
-  if (!payload || payload.length < 2) {
-    return (
-      `⚠️ *Please provide the message to broadcast to all candidates!*\n` +
-      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-      `Send your command like this:\n\n` +
-      `*msg all*\n` +
-      `*Happy Navratri to you nd your family.*\n\n` +
-      `💡 _The bot will automatically send the exact message below 'msg all' to all candidates in RecrutOS without sending 'msg all'._`
-    );
-  }
 
   // Fetch all unique candidates from RecrutOS Supabase
   const targets = await getAllRecrutOSCandidates();
@@ -1499,117 +1686,17 @@ export async function handleBroadcastToAllCandidates(text, waClient, context = {
     return `ℹ️ *No Eligible Candidates Found*\n━━━━━━━━━━━━━━━━━━━━━━\nFound 0 active non-blacklisted candidates with valid 10-digit phone numbers in RecrutOS.`;
   }
 
-  if (!waClient) {
+  // If no payload provided (e.g. just "message all" or "msg all") -> Enter conversational 2-step prompt
+  if (!payload || payload.length < 2) {
+    setPendingAllBroadcast(targets);
     return (
-      `⚠️ *WhatsApp Client Offline*\n` +
-      `━━━━━━━━━━━━━━━━━━━━━━\n` +
-      `Found *${totalCount} active candidates* across all sections in RecrutOS ready for this broadcast.\n\n` +
-      `💬 *Pending Message:*\n"${payload}"\n\n` +
-      `_However, the WhatsApp client is not active right now. Please start the WhatsApp bot to send live messages._`
+      `We find ${totalCount} candidates. What message do you want to trigger exactly? Please type that message to me.\n\n` +
+      `_(Reply with your exact message to send, or type *stop* / *cancel* to abort)_`
     );
   }
 
-  // Construct immediate confirmation report for the Trainer / Boss
-  const immediateAck =
-    `🚀 *Mass Broadcast Initiated to All Candidates!*\n` +
-    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-    `👥 Total Recipients: *${totalCount} candidates* (all sections in RecrutOS)\n` +
-    `💬 *Exact Message Being Sent:*\n"${payload}"\n\n` +
-    `⚡ *Status:* Background dispatch active with humanized anti-ban pacing (~1.5s - 2.5s per message).\n` +
-    `📱 Preview first recipients:\n` +
-    targets.slice(0, 4).map((c, i) => `${i + 1}. *${c.name}* (+91 ${c.phone})`).join('\n') +
-    (totalCount > 4 ? `\n_...and ${totalCount - 4} more candidates_\n` : '\n') +
-    `\n🔔 _I will send you live progress alerts every 50 messages and a final completion report right here once finished!_ 🎯`;
-
-  // Launch async background dispatch loop (unawaited so trainer chat gets instant response)
-  (async () => {
-    let sentCount = 0;
-    let failCount = 0;
-    const failedList = [];
-    console.log(`\n📢 [BroadcastAll] Starting broadcast of "${payload.slice(0, 40)}" to ${totalCount} candidates...`);
-
-    for (let i = 0; i < targets.length; i++) {
-      // Check if boss triggered master stop / pause during the broadcast
-      if (isAutoReplyPaused()) {
-        const pauseNotice =
-          `⏸️ *Broadcast Paused by Master Stop*\n` +
-          `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-          `Broadcast halted after ${i}/${totalCount} candidates (${sentCount} sent, ${failCount} failed) because a master pause command was triggered.`;
-        if (context.groupChat) {
-          await context.groupChat.sendMessage(pauseNotice).catch(() => {});
-        } else {
-          const tId = context.talkerId || getTrainerWaId();
-          if (tId) await waClient.sendMessage(tId, pauseNotice).catch(() => {});
-        }
-        console.log(`[BroadcastAll] Paused after ${sentCount} sent.`);
-        return;
-      }
-
-      const cand = targets[i];
-      const waId = `91${cand.phone}@c.us`;
-      const firstName = (cand.name || 'there').trim().split(' ')[0];
-      const textForCand = payload.includes('{name}')
-        ? payload.replace(/{name}/gi, firstName)
-        : payload;
-
-      try {
-        await waClient.sendMessage(waId, textForCand);
-        sentCount++;
-      } catch (sendErr) {
-        failCount++;
-        failedList.push(`${cand.name} (${cand.phone})`);
-        console.warn(`[BroadcastAll] Failed to send to ${cand.phone}:`, sendErr.message);
-      }
-
-      // Append note in RecrutOS silently
-      try {
-        await appendCandidateNote(cand.phone, `[Broadcast Sent] "${payload.slice(0, 60)}"`);
-      } catch (_) {}
-
-      // Humanized anti-ban pacing (1.5s - 2.5s)
-      await new Promise(r => setTimeout(r, 1500 + Math.random() * 1000));
-
-      // Milestone progress update every 50 candidates
-      if ((i + 1) % 50 === 0 && (i + 1) < totalCount) {
-        const progressMsg = `📊 *Broadcast Progress*: Delivered to ${sentCount}/${totalCount} candidates (${failCount} failed so far)...`;
-        if (context.groupChat) {
-          await context.groupChat.sendMessage(progressMsg).catch(() => {});
-        } else {
-          const tId = context.talkerId || getTrainerWaId();
-          if (tId) await waClient.sendMessage(tId, progressMsg).catch(() => {});
-        }
-      }
-    }
-
-    // Final Completion Report to Boss / Trainer
-    const completionReport =
-      `🎉 *Mass Broadcast Completed to All Candidates!*\n` +
-      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-      `👥 Total Candidates Targeted: *${totalCount}*\n` +
-      `✅ Delivered: *${sentCount}*\n` +
-      (failCount > 0 ? `⚠️ Delivery Failed: *${failCount}* (${failedList.slice(0, 4).join(', ')}${failedList.length > 4 ? '...' : ''})\n` : `✨ 100% Delivery Success Rate!\n`) +
-      `💬 *Message Sent:*\n"${payload}"\n\n` +
-      `📋 All candidate notes logged in RecrutOS. Any candidate who replies will alert you live! 🚀`;
-
-    if (context.groupChat) {
-      await context.groupChat.sendMessage(completionReport).catch(() => {});
-    } else {
-      const tId = context.talkerId || getTrainerWaId();
-      if (tId) await waClient.sendMessage(tId, completionReport).catch(() => {});
-    }
-
-    await logAgentActivity(waClient, {
-      action: 'Mass Broadcast All Candidates',
-      category: 'WHATSAPP',
-      details: `Broadcasted "${payload.slice(0, 60)}" to ${sentCount}/${totalCount} candidates across RecrutOS.`,
-      source: 'Saa Trainer (Msg All Command)',
-      notifyBoss: false
-    });
-
-    console.log(`✅ [BroadcastAll] Finished. ${sentCount} sent, ${failCount} failed.`);
-  })().catch(err => console.error('[BroadcastAll] Fatal error in background loop:', err));
-
-  return immediateAck;
+  // Single-turn broadcast: payload provided in same message
+  return executeBroadcastToCandidates(payload, targets, waClient, context);
 }
 
 // ── Ingest JD from Mumbai Job Alerts / Chat with Upfront Clarifications ───────
@@ -1772,6 +1859,7 @@ async function parseDirectCommand(text, todayStr, waClient, context = {}) {
 
   // ── 00. RESET / FORGET SESSION CONTEXT (/new, /reset, /clear, "start fresh") ───
   if (/^(\/new|\/reset|\/clear|\/forget|new\s*chat|start\s*fresh|forget\s*candidate|reset\s*context)\b/i.test(lower)) {
+    clearPendingAllBroadcast();
     const forgotten = resetSessionContext();
     return `🔄 *Fresh Session Started, Shetty Saa!*\n━━━━━━━━━━━━━━━━━━━━━━\n` +
       (forgotten ? `🗑️ Forgotten previous candidate: *${forgotten}*\n` : '') +
@@ -1779,10 +1867,61 @@ async function parseDirectCommand(text, todayStr, waClient, context = {}) {
       `Ready for fresh instructions! What would you like to do next? 🚀`;
   }
 
-  // ── 00AA. MASS BROADCAST TO ALL CANDIDATES ("msg all ...") ─────────────────
-  // E.g. "msg all\n\nHappy Navratri to you nd your family."
-  // E.g. "msg all Happy Diwali to you and your family"
-  // E.g. "message all candidates\nBest wishes on Eid!"
+  // ── 00. STOP ACTIVE RUNNING BROADCAST ─────────────────────────────────────────
+  if (/^(?:stop|cancel|halt|abort)\s+(?:broadcast|mass\s+broadcast|bulk\s+send|all\s+messages)/i.test(lower)) {
+    clearPendingAllBroadcast();
+    if (isBroadcastRunning()) {
+      stopBroadcast();
+      return `🛑 *Broadcast Halted!*\n━━━━━━━━━━━━━━━━━━━━━━\nThe active mass broadcast to candidates has been stopped immediately.`;
+    }
+    return `ℹ️ No mass candidate broadcast is currently running.`;
+  }
+
+  // ── 00AA. PENDING TWO-STEP MASS BROADCAST TO ALL CANDIDATES ───────────────────
+  const pendingBroadcast = getPendingAllBroadcast();
+  if (pendingBroadcast && pendingBroadcast.awaitingMessage) {
+    if (isMasterStopCommand(lower)) {
+      clearPendingAllBroadcast();
+      // Let it fall through to master stop handling below
+    } else if (isCancelBroadcastCommand(t)) {
+      clearPendingAllBroadcast();
+      return (
+        `🛑 *Broadcast Cancelled!*\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `The broadcast command has been cancelled. No messages were sent to candidates.`
+      );
+    } else if (isMsgAllCommand(t)) {
+      const newPayload = extractMsgAllPayload(t);
+      if (!newPayload || newPayload.length < 2) {
+        const freshTargets = await getAllRecrutOSCandidates();
+        setPendingAllBroadcast(freshTargets);
+        return (
+          `We find ${freshTargets.length} candidates. What message do you want to trigger exactly? Please type that message to me.\n\n` +
+          `_(Reply with your exact message to send, or type *stop* / *cancel* to abort)_`
+        );
+      }
+      clearPendingAllBroadcast();
+      return handleBroadcastToAllCandidates(t, waClient, context);
+    } else {
+      if (t.length < 2) {
+        return (
+          `⚠️ *Message too short!*\n` +
+          `What message do you want to trigger exactly? Please type the message to me, or type *stop* / *cancel* to abort.`
+        );
+      }
+      const broadcastText = t;
+      const targets = (pendingBroadcast.candidates && pendingBroadcast.candidates.length > 0)
+        ? pendingBroadcast.candidates
+        : await getAllRecrutOSCandidates();
+
+      clearPendingAllBroadcast();
+      return executeBroadcastToCandidates(broadcastText, targets, waClient, context);
+    }
+  }
+
+  // ── 00AB. MASS BROADCAST TO ALL CANDIDATES ("msg all ...") ─────────────────
+  // E.g. "msg all" -> prompts "We find X candidates..."
+  // E.g. "msg all Happy Diwali" -> triggers immediate broadcast
   if (isMsgAllCommand(t)) {
     return handleBroadcastToAllCandidates(t, waClient, context);
   }
@@ -1832,17 +1971,18 @@ async function parseDirectCommand(text, todayStr, waClient, context = {}) {
     await logAgentActivity(waClient, {
       action: 'Auto-Reply Paused (Master Stop)',
       category: 'SYSTEM',
-      details: 'Global automated candidate responses stopped by Shetty Saa. Only trainer will receive responses.',
+      details: 'Global automated candidate responses stopped by Shetty Saa. Listen-only mode active. Only trainer will receive responses.',
       source: 'Saa Trainer',
       notifyBoss: true
     });
     return `⏸️ *Understood Boss! Stopped Replying to Everyone.*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
       `🛑 All automated replies to anyone in your inbox are now **COMPLETELY STOPPED**.\n` +
       `👑 **Only listening and responding to you** (Trainer / Shetty Saa).\n\n` +
-      `💡 *Current Mode:*\n` +
-      `• Messages from candidates will still be logged silently to RecrutOS, but the bot will NOT send a single message or reply back.\n` +
-      `• You have 100% manual control over conversations without bot interference.\n\n` +
-      `Say *"reply all"* or *"start replying everyone"* whenever you want me to resume.`;
+      `💡 *Active Listen-Only Mode:*\n` +
+      `• Messages, resumes, and details from incoming candidates will still be listened to and synced silently into RecrutOS.\n` +
+      `• The bot will NOT send a single message, greeting, or burst back to candidates.\n` +
+      `• Trainer chat remains active and will reply only to you whenever you want.\n\n` +
+      `Say *"start replying"* or *"reply all"* whenever you want me to resume responding to candidates.`;
   }
 
   if (isMasterResumeCommand(lower)) {
@@ -1862,6 +2002,18 @@ async function parseDirectCommand(text, todayStr, waClient, context = {}) {
       `• Sharing job options, checking documents, and availability.\n` +
       `• Directing ready candidates to call you directly to proceed with their interview!\n\n` +
       `_Zero random topic chit-chat. 100% focused on candidate qualification._ 💼`;
+  }
+
+  // ── 0A2. AUTO-REPLY STATUS CHECK ───────────────────────────────────────────
+  if (/\b(?:auto\s*reply\s*status|bot\s*status|are\s+you\s+replying|is\s+auto\s*reply\s*(?:on|off|paused|active)|current\s+mode)\b/i.test(lower)) {
+    const isPaused = isAutoReplyPaused();
+    return `🤖 *Bot Auto-Reply Status*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `State: *${isPaused ? '⏸️ PAUSED (Listen-Only Mode)' : '▶️ ACTIVE (Auto-Replying to Candidates)'}*\n` +
+      `Candidate Messages: *${isPaused ? 'Ingesting silently (no outgoing candidate replies)' : 'Auto-answering with strict qualification'}*\n` +
+      `Trainer Chat: *👑 Dedicated to you (Shetty Saa)*\n\n` +
+      (isPaused
+        ? `To resume candidate replies: say *"start replying"* or *"reply all"*`
+        : `To stop candidate replies: say *"stop replying everyone"*`);
   }
 
   // ── 0B. SEARCH CANDIDATES BY LOCATION & SHARE COMPANY JD ───────────────────
