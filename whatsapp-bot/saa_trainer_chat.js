@@ -1440,6 +1440,75 @@ export function isBroadcastRunning() {
   return _isBroadcastInProgress;
 }
 
+// ── Account Safety & 24hr Cooldown Guard ────────────────────────────────────
+export function isAccountCooldownActive() {
+  try {
+    const p = path.resolve(__dirname, 'account_cooldown.json');
+    if (fs.existsSync(p)) {
+      const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+      if (data && data.outboundBlocked) {
+        const until = new Date(data.cooldownUntil).getTime();
+        if (Date.now() < until) {
+          const remainingHours = Math.ceil((until - Date.now()) / (1000 * 60 * 60));
+          return { active: true, remainingHours, reason: data.reason };
+        }
+      }
+    }
+  } catch (_) {}
+  return { active: false };
+}
+
+// ── State for resuming interrupted or paused broadcasts ─────────────────────
+let _remainingBroadcastState = null;
+const REMAINING_BROADCAST_FILE = path.resolve(__dirname, 'remaining_broadcast.json');
+
+export function getRemainingBroadcast() {
+  if (_remainingBroadcastState) return _remainingBroadcastState;
+  try {
+    if (fs.existsSync(REMAINING_BROADCAST_FILE)) {
+      const data = JSON.parse(fs.readFileSync(REMAINING_BROADCAST_FILE, 'utf8'));
+      if (data && data.remainingTargets && data.remainingTargets.length > 0) {
+        _remainingBroadcastState = data;
+        return _remainingBroadcastState;
+      }
+    }
+  } catch (err) {
+    console.warn('[BroadcastAll] Error reading remaining_broadcast.json:', err.message);
+  }
+  return null;
+}
+
+export function setRemainingBroadcast(state) {
+  _remainingBroadcastState = state;
+  try {
+    if (state) {
+      fs.writeFileSync(REMAINING_BROADCAST_FILE, JSON.stringify(state, null, 2), 'utf8');
+    } else {
+      if (fs.existsSync(REMAINING_BROADCAST_FILE)) fs.unlinkSync(REMAINING_BROADCAST_FILE);
+    }
+  } catch (err) {
+    console.warn('[BroadcastAll] Error saving remaining_broadcast.json:', err.message);
+  }
+}
+
+export function clearRemainingBroadcast() {
+  _remainingBroadcastState = null;
+  try {
+    if (fs.existsSync(REMAINING_BROADCAST_FILE)) fs.unlinkSync(REMAINING_BROADCAST_FILE);
+  } catch (_) {}
+}
+
+export function isResumeBroadcastCommand(text) {
+  const t = (text || '').trim().toLowerCase();
+  return (
+    /^(?:resume|resumes|continue|proceed|retry|send\s+remaining|remaining)\b/i.test(t) ||
+    (/\b(?:resume|resumes|remaining)\b/i.test(t) && /\b(?:all|broadcast|candidates?|msg|message)\b/i.test(t)) ||
+    /^(?:all\s+resumes?|resume\s+all)$/i.test(t) ||
+    /^(?:msg|message|send)\s+(?:with\s+)?all\s+resumes?$/i.test(t) ||
+    /^(?:msg|message)\s+all\s+resume$/i.test(t)
+  );
+}
+
 export function stopBroadcast() {
   _cancelActiveBroadcast = true;
   _pendingAllBroadcast = null;
@@ -1534,6 +1603,18 @@ export async function getAllRecrutOSCandidates() {
  * Executes mass broadcast to candidate list with anti-ban pacing and live feedback.
  */
 export async function executeBroadcastToCandidates(payload, targets, waClient, context = {}) {
+  const cd = isAccountCooldownActive();
+  if (cd.active) {
+    return (
+      `🛑 *Safety Lockdown Active (Account Protected)*\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `WhatsApp account safety cooldown is in effect.\n` +
+      `⏳ Cooldown remaining: *~${cd.remainingHours} hours*\n\n` +
+      `🛡️ All bulk outreach has been frozen to completely protect your phone number from further restrictions.\n` +
+      `Once the 24-hour hold is lifted, you can resume under the new safe quota rules.`
+    );
+  }
+
   const cleanPayload = (payload || '').trim();
   const totalCount = targets?.length || 0;
 
@@ -1575,6 +1656,7 @@ export async function executeBroadcastToCandidates(payload, targets, waClient, c
   (async () => {
     let sentCount = 0;
     let failCount = 0;
+    let consecutiveFailures = 0;
     const failedList = [];
     console.log(`\n📢 [BroadcastAll] Starting broadcast of "${cleanPayload.slice(0, 40)}" to ${totalCount} candidates...`);
 
@@ -1582,10 +1664,15 @@ export async function executeBroadcastToCandidates(payload, targets, waClient, c
       for (let i = 0; i < targets.length; i++) {
         // Check if boss triggered cancel broadcast during the run
         if (_cancelActiveBroadcast) {
+          _remainingBroadcastState = {
+            payload: cleanPayload,
+            remainingTargets: targets.slice(i)
+          };
           const pauseNotice =
             `🛑 *Broadcast Halted*\n` +
             `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-            `Broadcast halted after ${i}/${totalCount} candidates (${sentCount} sent, ${failCount} failed). Reason: Stop broadcast command triggered by Shetty Saa.`;
+            `Broadcast halted after ${i}/${totalCount} candidates (${sentCount} sent, ${failCount} failed). Reason: Stop broadcast command triggered by Shetty Saa.\n` +
+            `Type *"resume broadcast"* at any time to continue with the remaining ${totalCount - i} candidates.`;
           if (context.groupChat) {
             await context.groupChat.sendMessage(pauseNotice).catch(() => {});
           } else {
@@ -1596,6 +1683,30 @@ export async function executeBroadcastToCandidates(payload, targets, waClient, c
           return;
         }
 
+        // Circuit Breaker: Auto-pause if WhatsApp Web session disconnects or has repeated fatal errors
+        if (consecutiveFailures >= 3) {
+          _remainingBroadcastState = {
+            payload: cleanPayload,
+            remainingTargets: targets.slice(i)
+          };
+          const breakNotice =
+            `⚠️ *Broadcast Paused Automatically (Connection Guard)*\n` +
+            `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+            `WhatsApp Web connection encountered consecutive delivery errors (${consecutiveFailures} in a row).\n` +
+            `• Successfully sent so far: *${sentCount} / ${totalCount}*\n` +
+            `• Remaining: *${targets.length - i} candidates* (including ${targets[i]?.name || 'next'})\n\n` +
+            `🛑 Paused to protect your WhatsApp account and prevent missing any candidates.\n` +
+            `Once WhatsApp is reconnected, reply with *"resume broadcast"* to continue!`;
+          if (context.groupChat) {
+            await context.groupChat.sendMessage(breakNotice).catch(() => {});
+          } else {
+            const tId = context.talkerId || getTrainerWaId();
+            if (tId) await waClient.sendMessage(tId, breakNotice).catch(() => {});
+          }
+          console.warn(`[BroadcastAll] Circuit breaker tripped after ${consecutiveFailures} consecutive failures. Saved ${targets.length - i} remaining candidates.`);
+          return;
+        }
+
         const cand = targets[i];
         const waId = `91${cand.phone}@c.us`;
         const firstName = (cand.name || 'there').trim().split(' ')[0];
@@ -1603,22 +1714,51 @@ export async function executeBroadcastToCandidates(payload, targets, waClient, c
           ? cleanPayload.replace(/{name}/gi, firstName)
           : cleanPayload;
 
+        let sentSuccess = false;
         try {
+          // Human presence typing simulation (emulates real user typing in chat)
+          try {
+            const chat = await waClient.getChatById(waId).catch(() => null);
+            if (chat && typeof chat.sendStateTyping === 'function') {
+              await chat.sendStateTyping().catch(() => {});
+              await new Promise(r => setTimeout(r, 2000 + Math.random() * 2000));
+            }
+          } catch (_) {}
+
           await waClient.sendMessage(waId, textForCand);
           sentCount++;
+          consecutiveFailures = 0;
+          sentSuccess = true;
+
+          // Clear typing state
+          try {
+            const chat = await waClient.getChatById(waId).catch(() => null);
+            if (chat && typeof chat.clearState === 'function') {
+              await chat.clearState().catch(() => {});
+            }
+          } catch (_) {}
         } catch (sendErr) {
           failCount++;
+          consecutiveFailures++;
           failedList.push(`${cand.name} (${cand.phone})`);
-          console.warn(`[BroadcastAll] Failed to send to ${cand.phone}:`, sendErr.message);
+          console.warn(`[BroadcastAll] Failed to send to ${cand.phone} (${consecutiveFailures} consecutive):`, sendErr.message);
         }
 
-        // Append note in RecrutOS silently
-        try {
-          await appendCandidateNote(cand.phone, `[Broadcast Sent] "${cleanPayload.slice(0, 60)}"`);
-        } catch (_) {}
+        // Append note in RecrutOS ONLY if message was ACTUALLY delivered!
+        if (sentSuccess) {
+          try {
+            await appendCandidateNote(cand.phone, `[Broadcast Sent] "${cleanPayload.slice(0, 60)}"`);
+          } catch (_) {}
+        }
 
-        // Humanized anti-ban pacing (1.5s - 2.5s)
-        await new Promise(r => setTimeout(r, 1500 + Math.random() * 1000));
+        // Strict anti-ban human pacing (20s - 45s between contacts)
+        await new Promise(r => setTimeout(r, 20000 + Math.random() * 25000));
+
+        // Periodic safety pause: 3-minute cool-down every 15 messages to completely reset traffic burst counters
+        if ((i + 1) % 15 === 0 && (i + 1) < totalCount) {
+          console.log(`[BroadcastAll] Taking 3-minute anti-ban safety cool-down after ${i + 1} sends...`);
+          await new Promise(r => setTimeout(r, 180000));
+        }
 
         // Milestone progress update every 50 candidates
         if ((i + 1) % 50 === 0 && (i + 1) < totalCount) {
@@ -1631,6 +1771,9 @@ export async function executeBroadcastToCandidates(payload, targets, waClient, c
           }
         }
       }
+
+      // If we finished all candidates cleanly, clear any remaining state
+      _remainingBroadcastState = null;
 
       // Final Completion Report to Boss / Trainer
       const completionReport =
@@ -1917,6 +2060,38 @@ async function parseDirectCommand(text, todayStr, waClient, context = {}) {
       clearPendingAllBroadcast();
       return executeBroadcastToCandidates(broadcastText, targets, waClient, context);
     }
+  }
+
+  // Check if safety cooldown is active
+  if (isResumeBroadcastCommand(t) || isMsgAllCommand(t)) {
+    const cd = isAccountCooldownActive();
+    if (cd.active) {
+      clearPendingAllBroadcast();
+      return (
+        `🛑 *Safety Lockdown Active (Account Protected)*\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `WhatsApp account safety cooldown is in effect.\n` +
+        `⏳ Cooldown remaining: *~${cd.remainingHours} hours*\n\n` +
+        `🛡️ All bulk outreach has been frozen to completely protect your phone number from further restrictions.\n` +
+        `Once the 24-hour hold is lifted, you can resume under the new safe quota rules.`
+      );
+    }
+  }
+
+  // ── 00AA. RESUME PAUSED OR INTERRUPTED MASS BROADCAST ───────────────────────
+  if (isResumeBroadcastCommand(t)) {
+    const remaining = getRemainingBroadcast();
+    if (!remaining || !remaining.remainingTargets || remaining.remainingTargets.length === 0) {
+      return (
+        `ℹ️ *No Interrupted Broadcast Found*\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `There is no active paused broadcast in memory.\n\n` +
+        `To start a new broadcast to all candidates, simply type *"msg all"*!`
+      );
+    }
+    const { payload, remainingTargets } = remaining;
+    clearRemainingBroadcast();
+    return executeBroadcastToCandidates(payload, remainingTargets, waClient, context);
   }
 
   // ── 00AB. MASS BROADCAST TO ALL CANDIDATES ("msg all ...") ─────────────────

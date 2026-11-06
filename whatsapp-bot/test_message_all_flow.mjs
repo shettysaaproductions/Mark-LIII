@@ -3,6 +3,8 @@ import {
   isMsgAllCommand,
   extractMsgAllPayload,
   isCancelBroadcastCommand,
+  isResumeBroadcastCommand,
+  getRemainingBroadcast,
   getPendingAllBroadcast,
   setPendingAllBroadcast,
   clearPendingAllBroadcast,
@@ -132,8 +134,8 @@ assert.ok(triggerReply.includes('Total Recipients: *2 candidates*'));
 assert.ok(triggerReply.includes(broadcastMessage));
 assert.strictEqual(getPendingAllBroadcast(), null, 'Pending state must be cleared after trigger');
 
-// Wait brief moment for mock background async loop to deliver
-await new Promise(r => setTimeout(r, 4500));
+// Wait brief moment for mock background async loop to deliver (with safe pacing)
+await new Promise(r => setTimeout(r, 9500));
 console.log(`Delivered ${mockClient.sentMessages.length} messages in background.`);
 assert.ok(mockClient.sentMessages.length >= 2, 'Should have delivered messages to mock candidates');
 console.log('Sample sent message to candidate:', mockClient.sentMessages[0]);
@@ -152,6 +154,23 @@ assert.strictEqual(getPendingAllBroadcast(), null, 'Pending broadcast must be cl
 // Restore original requested user pause state
 setGlobalAutoReplyPaused(true, 'User requested: stop replying to everyone and listen until asked');
 console.log('✅ Test 7 passed!\n');
+
+// ── Test 8: Resume Broadcast Command Detection & State ────────────────────────
+console.log('Test 8: isResumeBroadcastCommand & getRemainingBroadcast...');
+assert.strictEqual(isResumeBroadcastCommand('all resumes'), true);
+assert.strictEqual(isResumeBroadcastCommand('all resume'), true);
+assert.strictEqual(isResumeBroadcastCommand('resume all'), true);
+assert.strictEqual(isResumeBroadcastCommand('resume broadcast'), true);
+assert.strictEqual(isResumeBroadcastCommand('resume'), true);
+assert.strictEqual(isResumeBroadcastCommand('message with all resumes'), true);
+assert.strictEqual(isResumeBroadcastCommand('send remaining'), true);
+assert.strictEqual(isResumeBroadcastCommand('msg all resume'), true);
+
+const diskRemaining = getRemainingBroadcast();
+assert.ok(diskRemaining !== null, 'Should load remaining candidates from remaining_broadcast.json');
+assert.strictEqual(diskRemaining.remainingTargets.length, 300, 'Must have 300 remaining targets');
+console.log(`Loaded ${diskRemaining.remainingTargets.length} candidates from remaining_broadcast.json`);
+console.log('✅ Test 8 passed!\n');
 
 console.log('🎉 ALL TESTS PASSED SUCCESSFULLY! 🚀');
 process.exit(0);

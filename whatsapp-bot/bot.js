@@ -22,6 +22,7 @@ const { Client, LocalAuth } = pkg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 import qrcodeTerminal from 'qrcode-terminal';
+import QRCode from 'qrcode';
 import { askAI, resetUserHistory, parseResumeWithAI } from './ai_engine.js';
 import { loadBotConfig } from './config.js';
 import { getBrowserExecutablePath } from './browser_helper.js';
@@ -115,11 +116,24 @@ import { startRecrutOSSyncWindow } from './recrutos_sync_window.js';
 
 // ── Startup cleanup — kill stale Chrome/lockfile from previous run ──────────
 try {
+  const out = execSync(
+    'wmic process where "Name=\'chrome.exe\'" get ProcessId,CommandLine /format:csv',
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+  );
+  for (const line of out.split(/\r?\n/)) {
+    if (!line.includes('remote-debugging-port')) continue;
+    const parts = line.split(',');
+    const pid = Number(parts[parts.length - 1]?.trim());
+    if (pid) {
+      try { execSync(`taskkill /PID ${pid} /F`, { stdio: 'ignore' }); } catch (_) {}
+      console.log(`🧹 [Startup] Killed stale puppeteer Chrome PID ${pid}`);
+    }
+  }
+} catch (_) {}
+try {
   const lockfilePath = path.resolve('.wwebjs_auth/session/lockfile');
   if (fs.existsSync(lockfilePath)) { fs.unlinkSync(lockfilePath); console.log('🧹 [Startup] Removed stale lockfile'); }
 } catch (_) {}
-// Note: if puppeteer still complains about "browser already running", the
-// run_whatsapp_bot.bat / OS-level cleanup must kill the process. See README.
 
 // ── Suppress known non-fatal puppeteer race condition ────────────────────────
 // whatsapp-web.js calls console.error() directly for TargetCloseError so
@@ -159,6 +173,10 @@ console.log('══════════════════════�
 // ── WhatsApp Client ──────────────────────────────────────────────────────────
 const client = new Client({
   authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth' }),
+  webVersionCache: {
+    type: 'remote',
+    remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1018944596-alpha.html',
+  },
   puppeteer: {
     executablePath,
     headless: true,
@@ -168,7 +186,8 @@ const client = new Client({
       '--disable-gpu', '--disable-session-crashed-bubble', '--disable-infobars',
       '--no-default-browser-check', '--disable-background-timer-throttling',
       '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding'
-    ]
+    ],
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
   }
 });
 
@@ -273,11 +292,33 @@ async function autoSaveContact(contact, suggestedName) {
 // ── Recruiter number (for human handoff notifications) ──────────────────────
 const RECRUITER_WA_ID = (process.env.RECRUITER_NUMBERS || '918080635121').split(',')[0].trim().replace(/\D/g, '') + '@c.us';
 
+// ── Helper: Check if message is to/from recruiter or trainer contact ───────
+function checkIsRecruiterMessage(msg) {
+  const targetId = msg?.from || '';
+  const cleanPh = cleanPhone(targetId);
+  return (
+    isRecruiter(targetId) ||
+    (cleanPh && isRecruiter(cleanPh)) ||
+    isFromTrainerContact(targetId) ||
+    (cleanPh && isFromTrainerContact(cleanPh)) ||
+    isTrainerContact(targetId) ||
+    (cleanPh && isTrainerContact(cleanPh))
+  );
+}
+
 // ── Helper: Send message safely with simulated typing delay ────────────────
 async function safeSend(msg, text) {
   try {
     const isGroup = msg.from?.includes('@g.us');
-    const isRecruiterUser = isRecruiter(cleanPhone(msg.from)) || isTrainerContact(msg.from);
+    const isRecruiterUser = checkIsRecruiterMessage(msg);
+
+    // Strict Master Pause / Listen-Only Guard:
+    // Block all outgoing messages to candidates and non-recruiters when paused.
+    if (!isRecruiterUser && isAutoReplyPaused()) {
+      console.log(`⏸️ [SafeSend] Blocked outgoing message to non-recruiter (${msg.from}) — Auto-reply is paused / listen-only mode.`);
+      return null;
+    }
+
     if (!isGroup && !isRecruiterUser && text && text.length > 0) {
       // Simulate realistic human typing delay (3.0 to 6.0s based on message length)
       const chatObj = await msg.getChat().catch(() => null);
@@ -289,10 +330,68 @@ async function safeSend(msg, text) {
     }
     await msg.reply(text);
   } catch (_) {
-    try { await client.sendMessage(msg.from, text); } catch (e) {
+    try {
+      const isRecruiterUser = checkIsRecruiterMessage(msg);
+      if (!isRecruiterUser && isAutoReplyPaused()) return null;
+      await client.sendMessage(msg.from, text);
+    } catch (e) {
       console.error('[Bot] Could not send message:', e.message);
     }
   }
+}
+
+/**
+ * Sends a sequence of 1-liner sentences as separate WhatsApp messages
+ * with natural human typing delay (1.2s - 2.0s) between each message,
+ * creating the realistic experience of a person typing quick text bubbles on their phone.
+ */
+async function sendOneLinerBurst(msg, lines) {
+  if (!lines || !lines.length) return;
+  const isRecruiterUser = checkIsRecruiterMessage(msg);
+
+  // Strict Master Pause / Listen-Only Guard:
+  // Block all outgoing burst messages to candidates and non-recruiters when paused.
+  if (!isRecruiterUser && isAutoReplyPaused()) {
+    console.log(`⏸️ [Burst] Blocked outgoing bursts to non-recruiter (${msg.from}) — Auto-reply is paused / listen-only mode.`);
+    return;
+  }
+
+  const isGroup = msg.from?.includes('@g.us');
+  const chatObj = await msg.getChat().catch(() => null);
+
+  for (let i = 0; i < lines.length; i++) {
+    const text = (lines[i] || '').trim();
+    if (!text) continue;
+
+    // Simulate natural human typing pause between separate message bubbles
+    if (!isGroup && chatObj) {
+      await chatObj.sendStateTyping().catch(() => {});
+      const delay = Math.floor(Math.random() * 800) + 1200; // 1.2s - 2.0s
+      await new Promise(r => setTimeout(r, delay));
+    }
+
+    try {
+      await client.sendMessage(msg.from, text);
+      console.log(`📤 [Burst ${i + 1}/${lines.length} → ${msg.from}]: "${text}"`);
+    } catch (_) {
+      try {
+        await msg.reply(text);
+      } catch (e) {
+        console.error('[Bot] sendOneLinerBurst error:', e.message);
+      }
+    }
+  }
+}
+
+/**
+ * Returns a readable upcoming date (e.g. "14 Oct", "5 Nov") for interview alignment options.
+ */
+function getUpcomingInterviewDateText() {
+  const d = new Date();
+  d.setDate(d.getDate() + 3);
+  const day = d.getDate();
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  return `${day} ${months[d.getMonth()]}`;
 }
 
 // ── Helper: Notify recruiter about a candidate ───────────────────────────────
@@ -872,13 +971,29 @@ async function handleRecruiterCommand(msg, rawText) {
 
 // ── WhatsApp Events ──────────────────────────────────────────────────────────
 
-client.on('qr', (qr) => {
+client.on('qr', async (qr) => {
   console.log('\n═══════════════════════════════════════════════════════');
   console.log('📱 SCAN THIS QR CODE WITH WHATSAPP:');
   console.log('   (WhatsApp → Linked Devices → Link a Device)');
   console.log('═══════════════════════════════════════════════════════\n');
   qrcodeTerminal.generate(qr, { small: true });
   console.log('\nWaiting for scan...\n');
+
+  try {
+    const qrLocal = path.resolve('./latest_qr.png');
+    await QRCode.toFile(qrLocal, qr, { width: 450, margin: 2 });
+    const artifactQr = path.resolve('C:/Users/samsa/.gemini/antigravity/brain/c96a3c3f-ec2d-4d9d-98ae-f40095348b76/whatsapp_qr.png');
+    try { fs.copyFileSync(qrLocal, artifactQr); } catch (_) {}
+    console.log('🖼️  [QR Image] Saved high-res QR code to latest_qr.png and artifact folder');
+    // Open image directly on desktop so user can scan immediately
+    if (!global._qrPopupShown) {
+      global._qrPopupShown = true;
+      try {
+        const { exec } = await import('child_process');
+        exec(`start "" "${qrLocal}"`);
+      } catch (_) {}
+    }
+  } catch (_) {}
 });
 
 client.on('authenticated', () => console.log('🔑 Authentication successful!'));
@@ -1118,6 +1233,15 @@ async function handleIncomingMessage(msg, overrideText = null) {
     return;
   }
 
+  // ── Global Auto-Reply Pause Notice (Listen-Only Mode) ─────────────────────
+  // When Boss says "stop replying everyone", we operate in Listen-Only mode:
+  // - Candidate messages, CVs, and referrals are ingested and synced to RecrutOS silently
+  // - All candidate-facing responses and bursts are suppressed by safeSend & sendOneLinerBurst
+  // - Only Trainer Chat / Shetty Saa (Boss) receives responses
+  if (!senderIsRecruiter && isAutoReplyPaused()) {
+    console.log(`👂 [Bot:ListenMode] Candidate message from ${contactName} (${candidatePhone || talkerId}) — ingesting details silently (auto-reply suppressed).`);
+  }
+
   // ── Verified / Enterprise / Corporate Account Guard ──────────────────────
   // Catches verified business accounts, official green-tick accounts, enterprise senders,
   // e-commerce brands (Amazon, Flipkart, Swiggy, Zomato, banks, etc.).
@@ -1256,6 +1380,7 @@ async function handleIncomingMessage(msg, overrideText = null) {
         console.log(`📄 [Resume Detected] Parsing resume for ${contactName} (${candidatePhone})...`);
         try {
           await (async () => {
+            if (isAutoReplyPaused() && !senderIsRecruiter) return;
             const chat = await msg.getChat().catch(() => null);
             if (chat) await chat.sendStateTyping().catch(() => {});
           })();
@@ -1353,9 +1478,20 @@ async function handleIncomingMessage(msg, overrideText = null) {
             // Save/refresh WA contact with current name
             saveCandidateContact(client, { name: existing.name, phone: existing.phone, experience: existing.experience || '', process: existing.process || 'BPO' }).catch(() => {});
 
-            // Smart follow-up reply based on parsed data
-            const followUp = buildCVFollowUp(resolvedName, parsed, existing);
-            await safeSend(msg, followUp);
+            // 1-liner conversational bursts on CV receipt
+            const followUpBursts = [
+              'CV mil gaya, options check kar raha hu..',
+              'Ache options aaye hai',
+              'Easy selections hai',
+              (parsed?.currently_working === 'Yes' || existing?.experience)
+                ? 'Sab documents hai experience ke companies ke?'
+                : 'Immediate joining hai kar payega na?',
+              'Kab available hai?',
+              `Kal karte hai interview ya ${getUpcomingInterviewDateText()}?`,
+              'Aap direct Shetty sir ko call kar lo baat karne ke liye: +91 8080635121 📞',
+              'Ek baar call pe baat karte hai fir interview ke liye proceed karte hai.'
+            ];
+            await sendOneLinerBurst(msg, followUpBursts);
             return;
           }
 
@@ -1378,15 +1514,32 @@ async function handleIncomingMessage(msg, overrideText = null) {
           };
           await handleIntakeComplete(talkerId, contactName, profile, msg);
 
-          // Smart follow-up after saving
-          const followUp = buildCVFollowUp(resolvedName, parsed, null);
-          await safeSend(msg, followUp);
+          // 1-liner conversational bursts after saving new candidate
+          const newCandBursts = [
+            'CV mil gaya, options check kar raha hu..',
+            'Ache options aaye hai',
+            'Easy selections hai',
+            (parsed?.currently_working === 'Yes')
+              ? 'Sab documents hai experience ke companies ke?'
+              : 'Immediate joining hai kar payega na?',
+            'Kab available hai?',
+            `Kal karte hai interview ya ${getUpcomingInterviewDateText()}?`,
+            'Aap direct Shetty sir ko call kar lo baat karne ke liye: +91 8080635121 📞',
+            'Ek baar call pe baat karte hai fir interview ke liye proceed karte hai.'
+          ];
+          await sendOneLinerBurst(msg, newCandBursts);
           return;
 
         } catch (e) {
           console.warn('[Bot] Resume parsing failed:', e.message);
-          // Even if parsing fails, ask the candidate follow-up questions
-          await safeSend(msg, buildCVFallback(contactName));
+          const fallbackBursts = [
+            'CV mil gaya, options check kar raha hu..',
+            'Ache options aaye hai',
+            'Easy selections hai',
+            'Abhi aap kahi working ho?',
+            'Aap direct Shetty sir ko call kar lo baat karne ke liye: +91 8080635121 📞'
+          ];
+          await sendOneLinerBurst(msg, fallbackBursts);
           return;
         }
       }
@@ -1755,9 +1908,9 @@ async function handleIncomingMessage(msg, overrideText = null) {
     }
   }
 
-  // ── Global Auto-Reply Pause Guard ──────────────────────────────────────────
+  // ── Global Auto-Reply Pause Guard (Listen-Only Mode) ───────────────────────
   if (!senderIsRecruiter && isAutoReplyPaused()) {
-    console.log(`⏸️ [Bot] Global auto-reply paused. Suppressing automated response to candidate ${contactName} (${talkerId}).`);
+    console.log(`⏸️ [Bot] Global auto-reply paused (Listen-Only active). Ingested candidate details for ${contactName} (${candidatePhone || talkerId}). Suppressed conversational replies.`);
     return;
   }
 
@@ -1784,82 +1937,145 @@ async function handleIncomingMessage(msg, overrideText = null) {
 
   if (!senderIsRecruiter && isTrulyNewUser && isNewUser(talkerId) && !alreadyGreetedRecently) {
     markUserSeen(talkerId);
-    const chatObj = await msg.getChat().catch(() => null);
-    if (chatObj) await chatObj.sendStateTyping().catch(() => {});
-
-    if (!isInIntakeFlow(talkerId)) {
-      const initialName = isLikelyName(contactName) ? contactName : '';
-      const greet =
-        `Hi${initialName ? ` *${initialName}*` : ''}! 👋 Welcome to *Mumbai Job Alerts*!\n\n` +
-        `We have openings at top companies like *JP Morgan, TCS, Concentrix, Teleperformance, Accenture* and more.\n\n` +
-        `Salaries: *₹18,000 – ₹60,000* per month in-hand. 💰\n\n` +
-        `📢 Join our daily job alerts channel:\n` +
-        `👉 https://whatsapp.com/channel/0029Vb8x3fGIt5rzTzmaZv2v\n\n` +
-        (initialName
-          ? `Which area in *Mumbai* are you currently based in? (e.g. Andheri, Thane, Malad...)\n\nWe are currently lining up candidates for top MNC *International Voice & Customer Ops* profiles with packages up to ₹35k–₹60k.`
-          : `Let me quickly understand your profile to find the best match for you.\n\n` + INTAKE_QUESTIONS.name);
-
-      setIntakeState(talkerId, {
-        step: initialName ? 'location' : 'name',
-        data: initialName ? { name: initialName } : {},
-        stepIndex: initialName ? 1 : 0,
-        retryCount: 0
-      });
-      await safeSend(msg, greet);
-      return;
-    }
+    const initialName = isLikelyName(contactName) ? contactName : '';
+    const bursts = [
+      `Hey${initialName ? ` ${initialName}` : ''}! Shetty sir right now available nahi hain.`,
+      `Cv bhejo options check karta hu..`,
+      `Abhi aap kahi working ho?`
+    ];
+    await sendOneLinerBurst(msg, bursts);
+    return;
   }
 
-  // ── Candidate Intake Flow ─────────────────────────────────────────────────
+  // ── Candidate Intake Flow Handoff ─────────────────────────────────────────
   if (!senderIsRecruiter && !existingCand && !chatAnalysis.hasPriorConversation && isInIntakeFlow(talkerId) && rawText) {
-    // Check for handoff triggers within intake
-    const handoffTriggers = ['call me', 'talk to someone', 'speak to', 'call karo', 'baat karni hai', 'talk karni'];
+    const handoffTriggers = ['call me', 'talk to someone', 'speak to', 'call karo', 'baat karni hai', 'talk karni', 'number do'];
     if (handoffTriggers.some(t => lowerText.includes(t))) {
       clearIntakeState(talkerId);
       flagForHumanReview(talkerId);
       await notifyRecruiter('human_requested', { name: contactName, phone: candidatePhone, waId: talkerId });
-      return safeSend(msg, `Noted! Our recruiter will personally call you shortly. Please keep your phone available. Direct number if needed: *+91 8080635121* 📞`);
+      const handoffBursts = [
+        'Aap direct Shetty sir ko call kar lo baat karne ke liye: +91 8080635121 📞',
+        'Ek baar call pe baat karte hai fir interview ke liye proceed karte hai.'
+      ];
+      await sendOneLinerBurst(msg, handoffBursts);
+      return;
+    }
+  }
+
+  // ── Direct Candidate Call Handoff Triggers ────────────────────────────────
+  const handoffTriggers = ['call me', 'talk to someone', 'speak to', 'call karo', 'please call', 'call karein', 'baat karni hai', 'number do', 'kisse baat karu'];
+  if (!senderIsRecruiter && handoffTriggers.some(t => lowerText.includes(t))) {
+    flagForHumanReview(talkerId);
+    await notifyRecruiter('human_requested', { name: contactName, phone: candidatePhone, waId: talkerId });
+    const handoffBursts = [
+      'Aap direct Shetty sir ko call kar lo baat karne ke liye: +91 8080635121 📞',
+      'Ek baar call pe baat karte hai fir interview ke liye proceed karte hai.'
+    ];
+    await sendOneLinerBurst(msg, handoffBursts);
+    return;
+  }
+
+  // ── RULE-BASED 1-LINER RECRUITMENT QUALIFICATION BURSTS ───────────────────
+  // Intercepts candidate responses to keep conversation strictly focused on jobs
+  // and delivers 100% of user directives in rapid 1-liner bursts with 0 LLM cost!
+  if (!senderIsRecruiter && rawText) {
+    const t = lowerText.trim();
+
+    // 1. Candidate is answering about current job/working status:
+    const isWorkingYes = /\b(currently\s+working|working|job\s+kar\s+raha|job\s+chalu|employed|haan\s+working|yes\s+working|wns|teleperformance|concentrix|accenture|tcs|bpo)\b/i.test(t);
+    const isWorkingNo = /\b(not\s+working|nahi|no|fresher|job\s+nahi|left\s+job|resigned|unemployed|ghar\s+pe|looking\s+for\s+job)\b/i.test(t);
+
+    if (isWorkingYes && !isWorkingNo) {
+      const bursts = [
+        'Ache options aaye hai',
+        'Easy selections hai',
+        'Sab documents hai experience ke companies ke?'
+      ];
+      if (!existingCand && !chatAnalysis?.hasCv) {
+        bursts.push('Cv bhejo options check karta hu..');
+      } else {
+        bursts.push('Kab available hai?');
+        bursts.push(`Kal karte hai interview ya ${getUpcomingInterviewDateText()}?`);
+        bursts.push('Aap direct Shetty sir ko call kar lo baat karne ke liye: +91 8080635121 📞');
+      }
+      await sendOneLinerBurst(msg, bursts);
+      return;
     }
 
-    const result = processIntakeStep(talkerId, rawText, contactName, chatHistory);
-    if (result.done) {
-      await handleIntakeComplete(talkerId, contactName, result.profile, msg);
-    } else {
-      const chatObj = await msg.getChat().catch(() => null);
-      if (chatObj) await chatObj.sendStateTyping().catch(() => {});
-      await safeSend(msg, result.reply);
+    if (isWorkingNo) {
+      const bursts = [
+        'Ache options aaye hai',
+        'Easy selections hai',
+        'Immediate joining hai kar payega na?'
+      ];
+      if (!existingCand && !chatAnalysis?.hasCv) {
+        bursts.push('Cv bhejo options check karta hu..');
+      } else {
+        bursts.push('Kab available hai?');
+        bursts.push(`Kal karte hai interview ya ${getUpcomingInterviewDateText()}?`);
+        bursts.push('Aap direct Shetty sir ko call kar lo baat karne ke liye: +91 8080635121 📞');
+      }
+      await sendOneLinerBurst(msg, bursts);
+      return;
     }
-    return;
+
+    // 2. Candidate confirms interview availability / documents ready:
+    if (/\b(kal|tomorrow|available|ready|kar\s+lunga|kar\s+payega|documents\s+hai|sab\s+hai|yes|haan|ha|monday|tuesday|wednesday|thursday|friday|saturday)\b/i.test(t) && !/\b(not|nahi|no)\b/i.test(t)) {
+      const bursts = [
+        'Done bhai!',
+        `Kal karte hai interview ya ${getUpcomingInterviewDateText()}?`,
+        'Aap direct Shetty sir ko call kar lo baat karne ke liye: +91 8080635121 📞',
+        'Ek baar call pe baat karte hai fir interview ke liye proceed karte hai.'
+      ];
+      await sendOneLinerBurst(msg, bursts);
+      return;
+    }
+
+    // 3. Candidate asks for job details (Company, Salary, Location, Process):
+    if (/\b(company|kaunsi|opening|openings|post|profile|process|salary|kitna|package|ctc|location|kaha|office|address|shift|timing)\b/i.test(t)) {
+      const bursts = [];
+      if (/company|kaunsi|opening/i.test(t)) {
+        bursts.push('Top MNCs like JP Morgan, TCS, Concentrix, Teleperformance me openings hai.');
+      } else if (/salary|package|ctc|kitna/i.test(t)) {
+        bursts.push('₹20,000 se ₹45,000 tak in-hand package hai.');
+      } else if (/location|kaha|office|address/i.test(t)) {
+        bursts.push('Malad West Mindspace, Thane, and Andheri locations pe hiring hai.');
+      } else {
+        bursts.push('International Voice processes hai, US/UK Night shift with pick & drop cab.');
+      }
+      bursts.push('Cv bhejo options check karta hu..');
+      bursts.push('Abhi aap kahi working ho?');
+      await sendOneLinerBurst(msg, bursts);
+      return;
+    }
+
+    // 4. Strict Anti-Chit-Chat Guard for unrelated topics (weather, chit chat, personal, gossip):
+    if (/\b(weather|song|movie|girlfriend|boyfriend|politics|modi|ipl|cricket|game|joke|who\s+are\s+you|kya\s+kar\s+rahe|kaise\s+ho)\b/i.test(t)) {
+      const bursts = [
+        'Main sirf job placements dekhta hu bhai.',
+        'Cv bhejo options check karta hu..',
+        'Abhi aap kahi working ho?'
+      ];
+      await sendOneLinerBurst(msg, bursts);
+      return;
+    }
   }
 
   // ── General AI Conversation ───────────────────────────────────────────────
   const intakeState = getIntakeState(talkerId);
-  // Combine all context sources: web, chat history, and raw message
   let fullPrompt = rawText || (mediaParts.length > 0 ? 'Please review this image/attachment and provide a helpful response.' : '');
   if (webContext) {
     fullPrompt += `\n\n[AGENT REACH — WEB CONTEXT]:\n${webContext}`;
-  }
-  // Note: Deep chat history and Supabase candidate profile are injected
-  // cleanly into systemInstruction and structured contents in ai_engine.js,
-  // keeping fullPrompt ultra-lean (<30 tokens) to minimize token consumption.
-
-  // Detect handoff triggers in general conversation
-  const handoffTriggers = ['call me', 'talk to someone', 'speak to', 'call karo', 'please call', 'call karein', 'baat karni hai'];
-  if (!senderIsRecruiter && handoffTriggers.some(t => lowerText.includes(t))) {
-    flagForHumanReview(talkerId);
-    await notifyRecruiter('human_requested', { name: contactName, phone: candidatePhone, waId: talkerId });
-    return safeSend(msg, `Noted! Our recruiter will personally call you on this number shortly. Please keep your phone available.\n\nDirect number: *+91 8080635121* 📞`);
   }
 
   try {
     const chatObj = await msg.getChat().catch(() => null);
     if (chatObj) await chatObj.sendStateTyping().catch(() => {});
 
-    // HUMAN REALISM DELAY: 5 to 9 seconds
-    // Simulates a real human recruiter reading the message and typing on phone
+    // Fast typing pause (1.5 to 3s)
     if (!senderIsRecruiter && !isShettyOfficeGroup) {
-      const delayMs = Math.floor(Math.random() * 4000) + 5000; // 5000ms - 9000ms (5 to 9s)
-      console.log(`⏳ [HumanTyping] Natural pause of ${(delayMs / 1000).toFixed(1)}s for ${contactName}...`);
+      const delayMs = Math.floor(Math.random() * 1500) + 1500;
       await new Promise(r => setTimeout(r, delayMs));
       if (chatObj) await chatObj.sendStateTyping().catch(() => {});
     }
@@ -1875,7 +2091,17 @@ async function handleIncomingMessage(msg, overrideText = null) {
       chatAnalysis,
       chatHistory
     );
-    await safeSend(msg, reply);
+
+    const replyBursts = (reply || '')
+      .split(/[\n\r]+/)
+      .map(s => s.trim())
+      .filter(Boolean);
+
+    if (!senderIsRecruiter && replyBursts.length > 0) {
+      await sendOneLinerBurst(msg, replyBursts);
+    } else {
+      await safeSend(msg, reply);
+    }
     console.log(`📤 [Reply → ${contactName}]: ${reply.slice(0, 80).replace(/\n/g, ' ')}...`);
 
     // Log bot's outgoing coordination reply so RecrutOS live feed shows full dialogue
@@ -2239,11 +2465,25 @@ export function matchCompanies(profile) {
 // ── Disconnection Handling & Auto-Reconnect ──────────────────────────────────
 client.on('disconnected', async (reason) => {
   console.warn('⚠️ WhatsApp client disconnected:', reason);
+  if (reason === 'LOGOUT') {
+    console.warn('⚠️ [Session] WhatsApp session was logged out. Cleaning up session directory to allow fresh QR pairing...');
+    try {
+      await client.destroy().catch(() => {});
+      const sessionDir = path.resolve('./.wwebjs_auth/session');
+      if (fs.existsSync(sessionDir)) {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+        console.log('🧹 [Session] Cleared logged-out session directory.');
+      }
+    } catch (_) {}
+  }
   console.log('🔄 Attempting to re-initialize WhatsApp client in 5 seconds...');
-  setTimeout(() => {
-    client.initialize().catch(err => {
+  setTimeout(async () => {
+    try {
+      await killStalePuppeteerChrome();
+      await client.initialize();
+    } catch (err) {
       console.error('❌ Re-initialize error:', err?.message || err);
-    });
+    }
   }, 5000);
 });
 
@@ -2374,18 +2614,33 @@ async function killStalePuppeteerChrome() {
 client.initialize().catch(async (err) => {
   const errMsg = err?.message || String(err);
 
-  // 'already running' = puppeteer Chrome still holding the profile dir.
-  // Kill only the puppeteer Chrome (not user's browser), clean lockfile, retry once.
+  // 1. Navigation / Execution context destroyed — standard WhatsApp Web redirect
+  if (errMsg.includes('Execution context was destroyed') || errMsg.includes('navigation')) {
+    console.warn('⚠️  [Init] Page navigated during startup — cleaning up and retrying in 3s...');
+    await client.destroy().catch(() => {});
+    await killStalePuppeteerChrome();
+    try {
+      await client.initialize();
+      return;
+    } catch (err2) {
+      console.error('❌ [Init] Navigation retry failed:', err2.message);
+    }
+  }
+
+  // 2. 'already running' = puppeteer Chrome still holding the profile dir.
   if (errMsg.includes('already running') || errMsg.includes('userDataDir')) {
-    console.warn('⚠️  [Init] Stale Chrome detected — cleaning up and retrying in 3 s...');
+    console.warn('⚠️  [Init] Stale Chrome detected — cleaning up and retrying in 3s...');
+    await client.destroy().catch(() => {});
     await killStalePuppeteerChrome();
     console.log('🔄 [Init] Retrying initialize...');
-    client.initialize().catch(err2 => {
+    try {
+      await client.initialize();
+      return;
+    } catch (err2) {
       console.error('❌ [Init] Retry also failed:', err2.message);
       console.error('   → Run: taskkill /IM chrome.exe /F  then restart the bot.');
       process.exit(1);
-    });
-    return;
+    }
   }
 
   console.error('❌ Failed to initialize WhatsApp client:', errMsg);
